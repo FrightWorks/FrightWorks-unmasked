@@ -98,7 +98,7 @@ copy, the GameCube DVD/card/audio paths and the renderer fixes work.
 ## Credits
 
 - **Maintainers**: BitsofBitsofBits, LoneRanger419
-- **Original Port:** JosiahG
+- **[Original Port](https://github.com/josiahg2502-glitch/Scooby-Doo-ReMasked):** JosiahG
 - **[WiiCompiled](https://github.com/patchzyy/Wiicompiled)** (the recompiler and runtime) by patchzyy and
   contributors, GPLv3
 - **Aurora** by Luke Street, MIT; Dawn, SDL3 and the other components listed in
