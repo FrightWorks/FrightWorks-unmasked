@@ -1,4 +1,4 @@
-# Scooby-Doo: Re-Masked
+# FrightWorks: UnMasked
 
 A statically recompiled PC port of **Scooby-Doo! Unmasked** (GameCube, 2005). The game's PowerPC code is translated
 ahead of time to C++ with [WiiCompiled](https://github.com/patchzyy/Wiicompiled) and compiled into a Windows program,
