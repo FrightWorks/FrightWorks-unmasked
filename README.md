@@ -35,7 +35,7 @@ modern renderer.
 You need **Windows 10 or 11 (64-bit)** and your own dump of **Scooby-Doo! Unmasked for the GameCube, USA
 (G5DE78)** as a `.iso`, `.gcm` or `.ciso` file (for example dumped with CleanRip on a Wii).
 
-![The launcher](<img width="2547" height="1385" alt="image" src="https://github.com/user-attachments/assets/fed0c8c5-76f3-4a16-b78e-735a35e604aa" />)
+![The launcher](image.png)
 
 1. Download the latest release and unzip it anywhere.
 2. Open **`Scooby-Doo Re-Masked.exe`**, the only program you need to open.
