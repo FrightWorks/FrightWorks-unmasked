@@ -103,9 +103,6 @@ copy, the GameCube DVD/card/audio paths and the renderer fixes work.
   contributors, GPLv3
 - **Aurora** by Luke Street, MIT; Dawn, SDL3 and the other components listed in
   [`wiicompiled/THIRD-PARTY-NOTICES.md`](wiicompiled/THIRD-PARTY-NOTICES.md)
-- Launcher title font **"Scooby Doo"** by Lauren Ashpole
-  ([FontSpace](https://www.fontspace.com/scooby-doo-font-f7039)), free for personal use
-- Launcher Scooby and Mystery Machine images: fan art (the Scooby picture also replaces the HUD portrait)
 - Button prompts from [Kenney's Input Prompts](https://kenney.nl/assets/input-prompts) (CC0)
 
 ## License
