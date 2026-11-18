@@ -5,6 +5,9 @@ ahead of time to C++ with [WiiCompiled](https://github.com/patchzyy/Wiicompiled)
 so there is no CPU emulator; the console's graphics, audio and system calls are reimplemented underneath, drawn by a
 modern renderer.
 
+Our other projects: 
+[FrightWorks: NO100F](https://github.com/FrightWorks/FrightWorks-no100f)
+
 ![The aquarium level in widescreen](docs/screenshots/aquarium.jpg)
 
 <p>
