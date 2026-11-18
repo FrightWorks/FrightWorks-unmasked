@@ -97,7 +97,8 @@ copy, the GameCube DVD/card/audio paths and the renderer fixes work.
 
 ## Credits
 
-- **Port:** JosiahG
+- **Maintainers: BitsofBitsofBits, LoneRanger419
+- **Original Port:** JosiahG
 - **[WiiCompiled](https://github.com/patchzyy/Wiicompiled)** (the recompiler and runtime) by patchzyy and
   contributors, GPLv3
 - **Aurora** by Luke Street, MIT; Dawn, SDL3 and the other components listed in
