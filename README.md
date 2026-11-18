@@ -5,9 +5,6 @@ ahead of time to C++ with [WiiCompiled](https://github.com/patchzyy/Wiicompiled)
 so there is no CPU emulator; the console's graphics, audio and system calls are reimplemented underneath, drawn by a
 modern renderer.
 
-Our other projects: 
-[FrightWorks: NO100F](https://github.com/FrightWorks/FrightWorks-no100f)
-
 ![The aquarium level in widescreen](docs/screenshots/aquarium.jpg)
 
 <p>
@@ -119,3 +116,6 @@ Scooby-Doo and all related characters and elements are trademarks of and © Hann
 Entertainment Inc. Scooby-Doo! Unmasked is © THQ / Warner Bros. Interactive. This is an unofficial fan project, not
 affiliated with or endorsed by them. This repository contains no game code, data or assets; the release contains
 the recompiled program but none of the game's data, which is read from your own copy of the game.
+
+# Other FrightWorks Projects
+[FrightWorks: NO100F](https://github.com/FrightWorks/FrightWorks-no100f) - Rebuild of Scooby Doo!: Night of 100 Frights
