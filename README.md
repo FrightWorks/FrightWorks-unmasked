@@ -97,7 +97,7 @@ copy, the GameCube DVD/card/audio paths and the renderer fixes work.
 
 ## Credits
 
-- **Maintainers: BitsofBitsofBits, LoneRanger419
+- **Maintainers**: BitsofBitsofBits, LoneRanger419
 - **Original Port:** JosiahG
 - **[WiiCompiled](https://github.com/patchzyy/Wiicompiled)** (the recompiler and runtime) by patchzyy and
   contributors, GPLv3
