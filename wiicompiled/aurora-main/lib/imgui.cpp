@@ -1,6 +1,9 @@
 #include "imgui.hpp"
+#include <aurora/window_owner.hpp>
+#include <stdexcept>
 
 #include <cstddef>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <string>
@@ -55,10 +58,11 @@ void create_context() noexcept {
   io.WantSaveIniSettings = false;
 }
 
-void initialize() noexcept {
+void initialize() {
   ZoneScoped;
   SDL_Renderer* renderer = window::get_sdl_renderer();
   ImGui_ImplSDL3_InitForSDLRenderer(window::get_sdl_window(), renderer);
+  ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_AutoAll);  // every connected pad plays, so every pad navigates
   g_useSdlRenderer = renderer != nullptr;
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
@@ -73,7 +77,7 @@ void initialize() noexcept {
   }
 }
 
-void shutdown() noexcept {
+void shutdown() {
   ZoneScoped;
   // Startup can fail before either backend initializes. A context alone does
   // not mean its renderer/platform backend owns resources to release.
@@ -136,7 +140,9 @@ bool wants_capture_event(const SDL_Event& event) noexcept {
   }
 }
 
-void new_frame(const AuroraWindowSize& size) noexcept {
+void new_frame(const AuroraWindowSize& size) {
+  if (window_owner::enabled() && (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable))
+    throw std::runtime_error("Window owner does not support ImGui multi-viewports");
   ZoneScoped;
   ImVec2 framebufferScale{
       size.width > 0 ? static_cast<float>(size.native_fb_width) / static_cast<float>(size.width) : 1.0f,
@@ -195,7 +201,7 @@ void render_frame_data() noexcept {
   g_frameDataBuilt = true;
 }
 
-void render(const wgpu::RenderPassEncoder& pass) noexcept {
+void render(const wgpu::RenderPassEncoder& pass, uint32_t targetWidth, uint32_t targetHeight) noexcept {
   ZoneScoped;
   render_frame_data();
 
@@ -205,11 +211,57 @@ void render(const wgpu::RenderPassEncoder& pass) noexcept {
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
-  } else {
+  } else if (data != nullptr) {
     pass.PushDebugGroup("Aurora: Dear Imgui");
-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
+    const float drawnWidth = data->DisplaySize.x * data->FramebufferScale.x;
+    const float drawnHeight = data->DisplaySize.y * data->FramebufferScale.y;
+    if (targetWidth != 0 && targetHeight != 0 && data->DisplaySize.x > 0.f && data->DisplaySize.y > 0.f &&
+        (std::lround(drawnWidth) != static_cast<long>(targetWidth) ||
+         std::lround(drawnHeight) != static_cast<long>(targetHeight))) {
+      // The window was resized after this ImGui frame began: draw it scaled to the target for this one frame
+      // (a shallow copy, as render_capture does) instead of with scissors outside the render area.
+      ImDrawData scaled = *data;
+      scaled.FramebufferScale = ImVec2(static_cast<float>(targetWidth) / data->DisplaySize.x,
+                                       static_cast<float>(targetHeight) / data->DisplaySize.y);
+      ImGui_ImplWGPU_RenderDrawData(&scaled, pass.Get());
+    } else {
+      ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
+    }
     pass.PopDebugGroup();
   }
+}
+
+void render_capture(const wgpu::RenderPassEncoder& pass, bool stampOnly, float scale) noexcept {
+  ZoneScoped;
+  render_frame_data();
+  const ImDrawData* data = ImGui::GetDrawData();
+  if (g_useSdlRenderer || data == nullptr) {
+    return;
+  }
+  // A shallow copy holding a subset of the lists; the backend sizes its viewport and scissors from
+  // DisplaySize * FramebufferScale, so the scale maps window coordinates onto the capture image.
+  ImDrawData capture = *data;
+  capture.CmdLists.clear();
+  capture.TotalVtxCount = 0;
+  capture.TotalIdxCount = 0;
+  for (ImDrawList* list : data->CmdLists) {
+    const char* owner = list->_OwnerName != nullptr ? list->_OwnerName : "";
+    if (std::strcmp(owner, AURORA_CAPTURE_HIDDEN_WINDOW) == 0 ||
+        (stampOnly && std::strcmp(owner, AURORA_CAPTURE_STAMP_WINDOW) != 0)) {
+      continue;
+    }
+    capture.CmdLists.push_back(list);
+    capture.TotalVtxCount += list->VtxBuffer.Size;
+    capture.TotalIdxCount += list->IdxBuffer.Size;
+  }
+  capture.CmdListsCount = capture.CmdLists.Size;
+  if (capture.CmdListsCount == 0) {
+    return;
+  }
+  capture.FramebufferScale = ImVec2(data->FramebufferScale.x * scale, data->FramebufferScale.y * scale);
+  pass.PushDebugGroup("Aurora: Dear Imgui capture");
+  ImGui_ImplWGPU_RenderDrawData(&capture, pass.Get());
+  pass.PopDebugGroup();
 }
 
 ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) noexcept {

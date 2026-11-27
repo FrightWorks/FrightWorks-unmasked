@@ -2,6 +2,7 @@ add_library(aurora_core STATIC
         lib/aurora.cpp
         lib/input.cpp
         lib/window.cpp
+        lib/window_owner.cpp
         lib/logging.cpp
         lib/system_info.cpp
         lib/system_info.hpp
@@ -34,6 +35,9 @@ if (AURORA_ENABLE_GX)
     target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX WEBGPU_DAWN)
     target_sources(aurora_core PRIVATE lib/webgpu/gpu.cpp lib/webgpu/gpu_cache.cpp lib/dawn/BackendBinding.cpp)
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
+    if (AURORA_DAWN_MSAA_PATCHED)
+        target_compile_definitions(aurora_core PRIVATE AURORA_DAWN_MSAA_PATCHED)
+    endif ()
     if (APPLE AND DAWN_ENABLE_METAL)
         find_library(AURORA_METALFX_FRAMEWORK MetalFX)
     endif ()

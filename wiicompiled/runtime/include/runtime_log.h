@@ -1,7 +1,7 @@
 #pragma once
 
-#ifndef MKW_RUNTIME_LOG_H
-#define MKW_RUNTIME_LOG_H
+#ifndef RUNTIME_LOG_H
+#define RUNTIME_LOG_H
 
 #include <cstdio>
 #include <iostream>
@@ -24,6 +24,11 @@
 #define RT_TAG_NAND "nand"
 #define RT_TAG_RIIVOLUTION "riivolution"
 #define RT_TAG_VI "vi"
+#define RT_TAG_SYSTEM "system"
+
+// Ends console.log for a normal exit that doesn't return from main (_Exit, ExitProcess, std::exit): drains what is
+// still in the pipe and writes the last line, "process transcript ended: <how>". Defined in main.cpp.
+void EndProcessTranscriptForExit(const char* how);
 
 // Stream form:  RT_LOG(RT_TAG_OS) << "OSCreateThread failed" << std::endl;
 #define RT_LOG(tag) (std::cerr << "[" tag "] ")
@@ -42,4 +47,4 @@ inline void LogMemoryError(const char* tag, const char* who,
               << e.address() << std::dec << " (" << e.reason() << ")" << std::endl;
 }
 
-#endif // MKW_RUNTIME_LOG_H
+#endif // RUNTIME_LOG_H

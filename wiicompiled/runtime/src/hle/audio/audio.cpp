@@ -5,6 +5,7 @@
 #include "hle_stubs.h"
 #include "ppc_runtime.h"
 #include "audio_backend.h"
+#include "audio_poll_clock.h"
 #include "ax_dsp.h"
 #include "music_attenuation.h"
 #include "runtime_log.h"
@@ -323,7 +324,10 @@ extern "C" void AIStartDMA_80124048()
         g_ai.bytesLeft = g_ai.length;
         g_ai.detBlockDueTicks = 0;
     }
-    if (!EnsureAudioBackend(rate)) {
+    // Every DMA start asks again; with no audio output, say so once (the backend logs the reason).
+    static bool s_reportedStartFailure = false;
+    if (!EnsureAudioBackend(rate) && !s_reportedStartFailure) {
+        s_reportedStartFailure = true;
         ReportAudioProblem("AIStartDMA", "audio backend init failed");
     }
 }
@@ -569,35 +573,15 @@ namespace {
 
 // Wall-clock delta since the previous poll, from whichever pump ran it. All
 // pumps live on the guest thread, so the one thread_local cursor is shared and
-// no interval is ever counted twice or dropped between them.
+// no interval is ever counted twice or dropped between them. Work is bounded by
+// kMaxBlocksPerTick, not by discarding elapsed time (FrightWorks-no100f #51: capping at
+// 100 ms threw the rest of a host stall away, and the audio due in it went silent).
 int64_t ConsumeAudioPollDeltaMicros()
 {
     using Clock = std::chrono::steady_clock;
     static thread_local Clock::time_point lastPoll = Clock::now();
 
-    const Clock::time_point now = Clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
-    lastPoll = now;
-
-    if (elapsed < 0) {
-        elapsed = 0;
-    }
-
-    // Cap the catch-up interval after a debugger pause or host stall; backlog drains via
-    // kMaxBlocksPerTick per pass. Never return early on a zero delta: two scheduler passes
-    // can land in the same microsecond and the backlog still needs servicing.
-    constexpr int64_t kMaxPollDeltaMicros = 100'000;
-    if (static const bool diag = std::getenv("AUDIO_STALL_DUMP") != nullptr; diag) {
-        static int64_t lost = 0, maxGap = 0, reported = 0;
-        maxGap = std::max<int64_t>(maxGap, elapsed);
-        if (elapsed > kMaxPollDeltaMicros) lost += elapsed - kMaxPollDeltaMicros;
-        if (lost - reported >= 1'000'000 || (maxGap > 50'000 && reported == 0 && lost == 0 && (reported = -1))) {
-            RT_LOGF(RT_TAG_AUDIO, "[aicb] poll gaps: %.2f s of audio time dropped, longest gap %.1f ms\n", lost / 1e6, maxGap / 1e3);
-            if (reported >= 0) reported = lost;
-        }
-    }
-    // microseconds::rep is long long; int64_t is long on LP64 Linux/Android.
-    return std::min<int64_t>(elapsed, kMaxPollDeltaMicros);
+    return AudioHleInternal::ConsumePollDeltaMicros(lastPoll, Clock::now());
 }
 
 } // namespace

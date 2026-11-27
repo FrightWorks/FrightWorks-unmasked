@@ -72,7 +72,7 @@ ECardResult CardGciFolder::openFile(const char* filename, FileHandle& handleOut)
 }
 
 ECardResult CardGciFolder::openFile(uint32_t fileno, FileHandle& handleOut) {
-  if (m_files.size() > fileno) {
+  if (m_files.size() > fileno && !m_files[fileno].filename.empty()) {  // empty = deleted
     auto& gciFile = m_files[fileno];
     handleOut = FileHandle(fileno, 0);
     gciFile.opened = true;
@@ -140,9 +140,32 @@ void CardGciFolder::deleteFile(const FileHandle& fh) {
     fileIO.deleteFile();
 }
 
-ECardResult CardGciFolder::deleteFile(const char* filename) { return ECardResult::NOCARD; }
+// CARDDelete / CARDFastDelete. These were stubs answering NOCARD, so a game that overwrites its save by deleting and
+// recreating it (Scooby-Doo! Night of 100 Frights) could never save twice. The entry keeps its slot (open file
+// handles are indices into m_files) with its name and blocks released.
+ECardResult CardGciFolder::deleteFile(const char* filename) {
+  for (uint32_t idx = 0; idx < m_files.size(); ++idx) {
+    if (!m_files[idx].filename.empty() && strcmp(filename, m_files[idx].file.m_filename) == 0)
+      return deleteFile(idx);
+  }
+  return ECardResult::NOFILE;
+}
 
-ECardResult CardGciFolder::deleteFile(uint32_t fileno) { return ECardResult::NOCARD; }
+ECardResult CardGciFolder::deleteFile(uint32_t fileno) {
+  if (fileno >= m_files.size() || m_files[fileno].filename.empty())
+    return ECardResult::NOFILE;
+  auto& gciFile = m_files[fileno];
+  std::error_code ec;
+  std::filesystem::remove(m_folderPath / gciFile.filename, ec);
+  if (ec)
+    return ECardResult::IOERROR;
+  m_bat.clear(gciFile.file.m_firstBlock, gciFile.file.m_blockCount);
+  gciFile.file.m_filename[0] = '\0';
+  gciFile.filename.clear();
+  gciFile.fileSize = 0;
+  gciFile.opened = false;
+  return ECardResult::READY;
+}
 
 ECardResult CardGciFolder::renameFile(const char* oldName, const char* newName) {
   for (auto& gciFile : m_files) {

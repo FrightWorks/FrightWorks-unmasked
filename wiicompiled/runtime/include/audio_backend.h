@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -23,6 +24,11 @@ public:
     void SetMasterVolume(float volume);
     void SetMuted(bool muted);
 
+    // Gets a copy of every block sent to the output (interleaved left/right S16, before the volume and mute), also
+    // the blocks a full queue drops. nullptr = none. Called on the audio thread with the backend's lock held.
+    using CaptureFn = void (*)(const int16_t* samples, size_t frames, uint32_t channels, uint32_t sampleRate);
+    void SetCapture(CaptureFn capture);
+
 private:
     AudioBackend() = default;
     ~AudioBackend() = default;
@@ -44,5 +50,8 @@ private:
     float m_masterVolume = 1.0f;
     bool m_muted = false;
     bool m_reportedDroppedBlock = false;
+    uint32_t m_failedInits = 0;  // failed output opens since the last success; retried every 5 s
+    std::chrono::steady_clock::time_point m_lastFailedInit{};
     std::vector<int16_t> m_convertBuffer;
+    CaptureFn m_capture = nullptr;
 };

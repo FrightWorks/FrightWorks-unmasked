@@ -2,6 +2,8 @@
 
 #include <aurora/aurora.h>
 #include <aurora/math.hpp>
+#include <string>
+#include <aurora/gfx.h>
 
 #include "wgpu.hpp"
 
@@ -30,6 +32,9 @@ struct PresentSource {
   wgpu::Texture texture;
   wgpu::Extent3D size;
   wgpu::TextureFormat format;
+  // The render-target (EFB) rectangle the picture was copied from, x, y, width, height in render pixels; zero width
+  // = the render target itself, 1:1. Motion vectors map through it to the presented picture.
+  std::array<float, 4> efbRect{};
 };
 struct Viewport {
   float left;
@@ -54,9 +59,26 @@ extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;
 extern TextureWithSampler g_frameBufferResolved;
 extern TextureWithSampler g_depthBuffer;
+// The EFB's motion targets when gfx::motion_vectors_active() (else empty), render-target size and sample count (with
+// MSAA they are multisampled like the EFB and never resolved: averaging the motion of two surfaces describes neither,
+// so readers take sample 0).
+// RG16F: per-pixel motion vectors.
+extern TextureWithSampler g_motionVectors;
+// R32F: the depth of the surface that owns each pixel's motion (raw, as the depth buffer holds it), which survives the
+// game clearing the depth buffer before its HUD.
+extern TextureWithSampler g_motionDepth;
+// R8: 1 where the HUD is drawn: effects that use the motion (motion blur) leave those pixels alone.
+extern TextureWithSampler g_motionMark;
+enum class MotionTarget { Motion, Depth, Mark };
+TextureWithSampler create_motion_target(MotionTarget target, uint32_t width, uint32_t height, uint32_t samples);
+// The three EFB motion targets above, or none (enabled false).
+void create_motion_targets(bool enabled);
+// The device can blend 32-bit float targets (motion depth of alpha-blended surfaces needs it).
+extern bool g_float32Blendable;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_PresentPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
+extern wgpu::BindGroup g_HdrCalibrationBindGroup;
 extern wgpu::Instance g_instance;
 extern bool g_bcTexturesSupported;
 // Vertex fetch written for drivers that miscompile aurora's storage-buffer vertex pulling (Adreno:
@@ -79,9 +101,20 @@ void shutdown();
 void fail_if_device_lost() noexcept;
 void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);
-// NSMBW: V-Sync (Fifo) on or off; the change is applied by take_vsync_change at a frame boundary.
+// V-Sync (Fifo) on or off; the change is applied by take_vsync_change at a frame boundary.
 // HDR output for the next device setup (startup only).
 void request_hdr(bool enabled, float paperWhiteNits, float peakNits) noexcept;
+bool set_hdr_brightness(float paperWhiteNits, float peakNits) noexcept;
+bool hdr_active() noexcept;
+// HDR was requested but startup found Windows HDR off for the game's display (so hdr_active() is false).
+bool hdr_sdr_display() noexcept;
+// The present shader: the shared copy shader plus, for HDR, the calibration uniform and the HDR fragment tail.
+// Exposed so the renderer tests run the same text the game does.
+const char* hdr_fragment_tail();
+std::string copy_shader_source(const std::string& fragmentTail, bool calibration);
+void set_hdr_calibration(const AuroraHdrCalibration* calibration) noexcept;
+// Called under the presentation queue-submit lock, before submitting the HDR copy.
+void upload_hdr_calibration();
 void request_vsync(bool enabled) noexcept;
 bool vsync_enabled() noexcept;
 // Applies a pending V-Sync change to the surface configuration; true when the swapchain must be reconfigured.
@@ -93,7 +126,7 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
 const TextureWithSampler& present_source() noexcept;
 PresentSource current_present_source() noexcept;
 void set_present_source_override(wgpu::BindGroup bindGroup, wgpu::Texture texture, wgpu::Extent3D size,
-                                 wgpu::TextureFormat format) noexcept;
+                                 wgpu::TextureFormat format, std::array<float, 4> efbRect = {}) noexcept;
 void clear_present_source_override() noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 wgpu::BindGroup create_copy_bind_group(wgpu::TextureView sourceView, wgpu::Sampler sampler);

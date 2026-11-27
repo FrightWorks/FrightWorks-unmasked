@@ -1,10 +1,12 @@
-#include <set>
 #include <cstdio>
+#include <exception>
 #include <absl/container/flat_hash_set.h>
 #include <array>
 #include "command_processor.hpp"
 
+#include "../gfx/bloom.hpp"
 #include "../gfx/common.hpp"
+#include "../gfx/scene_stage.hpp"
 #include "../dolphin/gx/__gx.h"
 #include "../gfx/texture_replacement.hpp"
 #include "dolphin/gx/GXAurora.h"
@@ -12,6 +14,7 @@
 #include "gx_fmt.hpp"
 #include "pipeline.hpp"
 #include "shader_info.hpp"
+#include "billboard_depth.hpp"
 #include "../internal.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -29,17 +32,36 @@
 #include <vector>
 
 extern "C" {
-int g_spmDrawDump = 0;
-int g_spmSweepDump = 0;
-unsigned g_spmDrawIdx = 0;
-unsigned g_spmDrawLimit = ~0u;  // diagnostic: only the first N draws of each frame are rendered (env SPM_DRAW_LIMIT)  // set by spm_map_sweep for a couple of frames (env SPM_SWEEP_DUMP=<map>)
-int g_spmBBoxArmed = 0;
-unsigned g_spmAudit[8] = {};  // render audit for tools/sweep-spm-maps.py
-unsigned g_spmGameClear = 0;  // the game's own EFB clear colour (0xRRGGBB) while sweeping
-int g_spmCullOff = 0;
+int g_gxDrawDump = 0;
+unsigned g_gxDrawIdx = 0;
+unsigned g_gxDrawLimit = ~0u;  // diagnostic: only the first N draws of each frame are rendered (env NO100F_DRAW_LIMIT)
+int g_gxBBoxArmed = 0;
+unsigned g_gxAudit[8] = {};  // render audit counters, shown by the diagnostic logs
+int g_gxCullOff = 0;
 }
 namespace aurora::gx {
 GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noexcept;  // gx.cpp
+// NO100F: the last texture copies (GXCopyTex) as size and format, so a 2D draw pasting one back can be told apart
+// (the runtime gives Aurora a different pointer for the texture than for the copy destination).
+static std::array<std::atomic<u32>, 8> g_recentCopies{};
+static std::atomic<u32> g_recentCopyNext{0};
+static u32 copy_key(u32 w, u32 h, u32 fmt) noexcept { return (w & 0xFFF) << 20 | (h & 0xFFF) << 8 | (fmt & 0xFF); }
+void note_tex_copy_dest(const void*) noexcept {
+  const u32 key = copy_key(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, g_gxState.texCopyFmt);
+  g_recentCopies[g_recentCopyNext.fetch_add(1, std::memory_order_relaxed) % 8].store(key, std::memory_order_relaxed);
+}
+static bool is_fullscreen_overlay_shape(GXPrimitive prim, u32 n) noexcept {
+  return (n == 4 && (prim == GX_QUADS || prim == GX_TRIANGLESTRIP || prim == GX_TRIANGLEFAN)) || (n == 6 && prim == GX_TRIANGLES);
+}
+static bool is_recent_copy_dest(const GXTexObj_& t) noexcept {
+  if (t.data == nullptr) return false;
+  const u32 key = copy_key(t.width(), t.height(), t.format());
+  for (const auto& d : g_recentCopies) if (d.load(std::memory_order_relaxed) == key) return true;
+  return false;
+}
+bool skip_hor_plus_widen() noexcept;  // command_processor.cpp, below
+// NO100F: set while a raw (RenderWare 2D) draw that is an untextured full-screen overlay is submitted.
+static bool g_rawFullscreenOverlay = false;
 }
 
 namespace aurora::gx {
@@ -326,19 +348,24 @@ static inline void mark_pipeline_state_dirty() noexcept {
   } while (0)
 
 static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
-  if (g_spmDrawDump && addr < 0x78) {  // dump frame: every position-matrix load and the draw it precedes
-    static int n = 0;
-    if (n++ < 4000) {
-      auto f = [&](u32 i) { return i < len ? std::bit_cast<float>(bigEndian ? __builtin_bswap32(*reinterpret_cast<const u32*>(data + i * 4)) : *reinterpret_cast<const u32*>(data + i * 4)) : 0.f; };
-      Log.warn("[xfmtx] before draw {} addr {:#x} len {} t=({:.2f},{:.2f},{:.2f})", g_spmAudit[0] + 1, addr, len, f(3), f(7), f(11));
-    }
-  }
   if (addr < 0x78) {
     // Position matrices (0x0000 - 0x0077)
     u32 mtxIdx = addr / 12;
     u32 startOffset = addr % 12;
     // We only support full writes to matrices
     XF_REQUIRE(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob; mtxIdx={}", mtxIdx);
+    if (!(startOffset == 0 && len == 12)) {  // NO100F diagnostic: what the odd write holds (first few)
+      static int dumped = 0;
+      if (dumped++ < 4) {
+        std::string vals;
+        for (u32 i = 0; i < len && i < 24; i++) vals += fmt::format(" {:.4g}", read_f32(data + i * 4, bigEndian));
+        std::string before, desc;
+        for (int i = -96; i < 8; i++) before += fmt::format(" {:02x}", data[i]);
+        for (u32 a = 0; a < 21; a++) desc += fmt::format("{}", static_cast<int>(g_gxState.vtxDesc[a]));
+        Log.warn("XF odd write addr=0x{:03X} len={} | aurora vtxDesc(attr0..20)={} | bytes[-96..+8]:{}", addr, len, desc,
+                 before);
+      }
+    }
     XF_REQUIRE(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
     auto& mtx = g_gxState.pnMtx[mtxIdx].pos;
     f32* flat = reinterpret_cast<f32*>(&mtx);
@@ -475,8 +502,8 @@ static void apply_xf_viewport() {
   constexpr f32 z24Scale = 16777216.0f;
 
   set_logical_viewport({
-      .left = ox - 340.0f - width / 2.0f,
-      .top = oy - 340.0f - height / 2.0f,
+      .left = ox - 342.0f - width / 2.0f,  // GX viewport origin offset is 342 (as the SDK encodes it)
+      .top = oy - 342.0f - height / 2.0f,
       .width = width,
       .height = height,
       .znear = (oz - sz) / z24Scale,
@@ -484,15 +511,15 @@ static void apply_xf_viewport() {
   });
 }
 
-// NSMBW: the screen's aspect while the game's view is widened past 16:9 (0 = off). See below.
+// The screen's aspect while the game's view is widened past 16:9 (0 = off). See below.
 std::atomic<float> g_widePerspectiveAspect{0.0f};
-static float g_spmProjWiden = 1.f;  // the horizontal factor the current projection was widened by
+static float g_gxProjWiden = 1.f;  // the horizontal factor the current projection was widened by
 
 static void apply_xf_projection() {
   const auto& raw = g_gxState.xfProjection;
   auto& proj = g_gxState.proj;
   proj = {};
-  // NSMBW: on a screen wider than 16:9 the picture fills it, so a camera set up for 16:9 would be
+  // On a screen wider than 16:9 the picture fills it, so a camera set up for 16:9 would be
   // stretched sideways. Re-derive its horizontal scale from the screen's aspect instead: the same
   // vertical view, more to the sides (Hor+), around the same centre. Cameras already set up wider
   // are left alone. That covers the perspective ones (world map, title) and the orthographic one
@@ -500,13 +527,27 @@ static void apply_xf_projection() {
   float widen = 1.0f;
   const float wide = g_widePerspectiveAspect.load(std::memory_order_relaxed);
   if (wide > 0.0f && raw[0] != 0.0f && raw[2] != 0.0f) {
-    const float aspect = raw[2] / raw[0];
-    const bool screenSized = g_gxState.projType != GX_ORTHOGRAPHIC || 2.0f / raw[2] > 150.0f;
-    if (aspect > 1.68f && aspect < 1.88f && screenSized) {
+    // abs: NO100F's 2D ortho flips y (negative scale); its HUD widens with the 3D view so the pieces line up.
+    const float aspect = std::abs(raw[2] / raw[0]);
+    const bool screenSized = g_gxState.projType != GX_ORTHOGRAPHIC || 2.0f / std::abs(raw[2]) > 150.0f;
+    // NO100F has no 16:9 mode: its 4:3 cameras widen the same way.
+    if (((aspect > 1.68f && aspect < 1.88f) || (aspect > 1.25f && aspect < 1.42f)) && screenSized) {
       widen = aspect / wide;
     }
   }
-  g_spmProjWiden = widen;
+  g_gxProjWiden = widen;
+  {  // NO100F diagnostic (env NO100F_PROJ_LOG): every distinct projection once, with the viewport/scissor it met
+    static const bool on = std::getenv("NO100F_PROJ_LOG") != nullptr;
+    static std::vector<std::array<float, 4>> seen;
+    const std::array<float, 4> key{raw[0], raw[2], float(g_gxState.projType), g_gxState.logicalViewport.width};
+    if (on && seen.size() < 200 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+      seen.push_back(key);
+      Log.warn("[no100fproj] type {} raw {:.5f} {:.5f} {:.5f} {:.5f} {:.6f} {:.4f} aspect {:.3f} widen {:.3f} vp {}x{} at {},{} sc {}x{}",
+               (int)g_gxState.projType, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[2] / raw[0], widen,
+               g_gxState.logicalViewport.width, g_gxState.logicalViewport.height, g_gxState.logicalViewport.left, g_gxState.logicalViewport.top,
+               g_gxState.logicalScissor.width, g_gxState.logicalScissor.height);
+    }
+  }
   proj.m0[0] = raw[0] * widen;
   proj.m1[1] = raw[2];
   proj.m2[2] = raw[4];
@@ -532,19 +573,19 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
 static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
 static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 
-// NSMBW: time spent decoding GX commands (and waiting for the renderer lock first), and draws
-// decoded, for the runtime's NSMBW_LOG_FPS breakdown.
+// Time spent decoding GX commands (and waiting for the renderer lock first), and draws
+// decoded, for the runtime's NO100F_LOG_FPS breakdown.
 std::atomic<uint64_t> g_statProcessNanos{0}, g_statLockNanos{0}, g_statDraws{0};
 std::atomic<uint64_t> g_statProcessTotalNanos{0};  // never reset: slow-frame breakdowns take deltas
 thread_local int t_statDepth = 0;  // only the outermost of nested process()/raw draws counts
 // Timed on Windows always (the slow-frame log splits a frame into GX and the rest), elsewhere only
-// while the runtime logs frame times (NSMBW_LOG_FPS): two clock reads per outermost call add up on a
+// while the runtime logs frame times (NO100F_LOG_FPS): two clock reads per outermost call add up on a
 // phone. Read at first use: on Android the runtime sets the variable from a property after startup.
 static bool StatTiming() {
 #if defined(_WIN32)
   return true;
 #else
-  static const bool on = std::getenv("NSMBW_LOG_FPS") != nullptr;
+  static const bool on = std::getenv("NO100F_LOG_FPS") != nullptr;
   return on;
 #endif
 }
@@ -566,10 +607,10 @@ struct ProcessTimer {
   }
 };
 
-// NSMBW debugging: NSMBW_MERGE_SUSPECTS logs register writes that changed a value but left the state
+// Debugging: NO100F_MERGE_SUSPECTS logs register writes that changed a value but left the state
 // clean, when a draw then merged into the previous one (state that a merged draw would not see).
 static bool MergeSuspectsOn() {
-  static const bool on = std::getenv("NSMBW_MERGE_SUSPECTS") != nullptr;
+  static const bool on = std::getenv("NO100F_MERGE_SUSPECTS") != nullptr;
   return on;
 }
 static std::vector<u32> g_mergeSuspects;  // kind << 16 | register
@@ -659,7 +700,7 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
       const u32 byteOffset = srcArrayIdx * array.stride;
       const u32 byteCount = static_cast<u32>(len) * 4u;
       if (array.data == nullptr || array.stride == 0 || byteOffset + byteCount > array.size) {
-        ++g_spmAudit[4];
+        ++g_gxAudit[4];
         static u32 invalidIndexedXfLogCount = 0;
         if (invalidIndexedXfLogCount < 16) {
           Log.warn("Skipping indexed XF load with invalid source array: array={} idx={} stride={} offset={} bytes={} "
@@ -692,7 +733,7 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
     case CP_CMD_CALL_DL: {
       // Call display list: 8 bytes (address + size)
       CHECK(pos + 8 <= size, "call DL read overrun");
-      ++g_spmAudit[5];
+      ++g_gxAudit[5];
       Log.warn("Ignoring nested GX_CMD_CALL_DL");
       pos += 8;
       break;
@@ -872,7 +913,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     else  // keep the cached register honest so the game's own coplanar-off write is not deduplicated away
       g_gxState.bpRegCache[0x00] = (g_gxState.bpRegCache[0x00] & ~(1u << 19)) | (u32(g_gxState.zFreeze) << 19);
     u32 hwCull = bp_get(value, 2, 14);
-    { static int n = 0; if (g_spmDrawDump && n++ < 400) Log.warn("[spmgen] genmode {:#08x} hwcull {} texgens {} tev {}", value & 0xFFFFFF, hwCull, bp_get(value, 4, 0), bp_get(value, 4, 10) + 1); }
+    { static int n = 0; if (g_gxDrawDump && n++ < 400) Log.warn("[gxgen] genmode {:#08x} hwcull {} texgens {} tev {}", value & 0xFFFFFF, hwCull, bp_get(value, 4, 0), bp_get(value, 4, 10) + 1); }
     // Swap front/back to match GX convention
     switch (hwCull) {
     case GX_CULL_FRONT:
@@ -885,8 +926,8 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.cullMode = static_cast<GXCullMode>(hwCull);
       break;
     }
-    if (g_spmCullOff == 1) g_gxState.cullMode = GX_CULL_NONE;
-    if (g_spmCullOff == 3) {  // diagnostic: swap front/back culling
+    if (g_gxCullOff == 1) g_gxState.cullMode = GX_CULL_NONE;
+    if (g_gxCullOff == 3) {  // diagnostic: swap front/back culling
       if (g_gxState.cullMode == GX_CULL_BACK) g_gxState.cullMode = GX_CULL_FRONT;
       else if (g_gxState.cullMode == GX_CULL_FRONT) g_gxState.cullMode = GX_CULL_BACK;
     }
@@ -1023,7 +1064,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 idx = regId - 0x28;
     u32 stage0 = idx * 2;
     u32 stage1 = idx * 2 + 1;
-    { static int n = 0; if (g_spmDrawDump && n++ < 300) Log.warn("[spmtref] bp {:#x} = {:#08x} (st{} map {} coord {} en {} | st{} map {} coord {} en {})", regId, value & 0xFFFFFF, stage0, bp_get(value, 3, 0), bp_get(value, 3, 3), bp_get(value, 1, 6), stage1, bp_get(value, 3, 12), bp_get(value, 3, 15), bp_get(value, 1, 18)); }
+    { static int n = 0; if (g_gxDrawDump && n++ < 300) Log.warn("[gxtref] bp {:#x} = {:#08x} (st{} map {} coord {} en {} | st{} map {} coord {} en {})", regId, value & 0xFFFFFF, stage0, bp_get(value, 3, 0), bp_get(value, 3, 3), bp_get(value, 1, 6), stage1, bp_get(value, 3, 12), bp_get(value, 3, 15), bp_get(value, 1, 18)); }
 
     // Channel ID reverse mapping from hardware to GX
     static const GXChannelID r2c[] = {GX_COLOR0A0, GX_COLOR1A1,   GX_COLOR0A0,    GX_COLOR1A1,
@@ -1056,9 +1097,9 @@ static void handle_bp(u32 value, bool bigEndian) {
 
   // Z mode (0x40)
   case 0x40: {
-    g_gxState.depthCompare = bp_get(value, 1, 0) != 0 && g_spmCullOff != 2;
+    g_gxState.depthCompare = bp_get(value, 1, 0) != 0 && g_gxCullOff != 2;
     g_gxState.depthFunc = static_cast<GXCompare>(bp_get(value, 3, 1));
-    if (g_spmCullOff == 4) {  // diagnostic: invert the depth comparison direction
+    if (g_gxCullOff == 4) {  // diagnostic: invert the depth comparison direction
       switch (g_gxState.depthFunc) {
       case GX_LESS: g_gxState.depthFunc = GX_GREATER; break;
       case GX_LEQUAL: g_gxState.depthFunc = GX_GEQUAL; break;
@@ -1288,7 +1329,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 idx = (regId - 0xE0) / 2;
     bool isRA = (regId & 1) == 0;
     bool isKColor = bp_get(value, 1, 23) != 0;
-    { static int n = 0; if (g_spmDrawDump && n++ < 200) Log.warn("[spmkreg] bp {:#x} = {:#08x} k {} idx {} {}", regId, value & 0xFFFFFF, isKColor, idx, isRA ? "RA" : "BG"); }
+    { static int n = 0; if (g_gxDrawDump && n++ < 200) Log.warn("[gxkreg] bp {:#x} = {:#08x} k {} idx {} {}", regId, value & 0xFFFFFF, isKColor, idx, isRA ? "RA" : "BG"); }
 
     if (isKColor) {
       // K color register (8-bit components)
@@ -1438,7 +1479,6 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 a = bp_get(value, 8, 8);
     g_gxState.clearColor[0] = static_cast<float>(r) / 255.f;
     g_gxState.clearColor[3] = static_cast<float>(a) / 255.f;
-    g_spmGameClear = (g_spmGameClear & 0x00FFFFu) | (u32(r) << 16);  // recorded for the sweep report only
     g_gxState.stateDirty = true;
     break;
   }
@@ -1447,7 +1487,6 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 g = bp_get(value, 8, 8);
     g_gxState.clearColor[2] = static_cast<float>(b) / 255.f;
     g_gxState.clearColor[1] = static_cast<float>(g) / 255.f;
-    g_spmGameClear = (g_spmGameClear & 0xFF0000u) | (u32(g) << 8) | b;
     g_gxState.stateDirty = true;
     break;
   }
@@ -1824,7 +1863,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
       case 0x11: {
         // Channel control registers
         u32 chanId = reg - 0x0E;
-        { static int n = 0; if (g_spmDrawDump && n++ < 120) Log.warn("[spmchan] xf chanctrl {} = {:#x}", chanId, val); }
+        { static int n = 0; if (g_gxDrawDump && n++ < 120) Log.warn("[gxchan] xf chanctrl {} = {:#x}", chanId, val); }
         if (chanId < MaxColorChannels) {
           auto& chan = g_gxState.colorChannelConfig[chanId];
           chan.matSrc = static_cast<GXColorSrc>(bp_get(val, 1, 0));
@@ -1967,7 +2006,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
 
 static void handle_draw_overrun(u8 cmd, u16 vtxCount, u32 vtxSize, u32 totalVtxBytes, const u8* data, const u32& pos,
                                 u32 size) {
-  ++g_spmAudit[1];
+  ++g_gxAudit[1];
   static u32 truncatedDrawLogCount = 0;
   if (truncatedDrawLogCount >= 64) {
     if (truncatedDrawLogCount == 64) {
@@ -2045,13 +2084,15 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
-                                 HashType geometrySignature, bool interpolationIdentityActive);
+                                 HashType geometrySignature, bool interpolationIdentityActive,
+                                 std::span<const float> particleDepths = {});
 
 // The per-draw geometry signature, matrix-usage mask and draw-identity hashes exist purely to feed frame interpolation (build_uniform consumes them only after its `frame_interpolation_fps() == 0` early-out).
 static inline bool frame_interpolation_identity_needed() noexcept {
-  // SPM draws its levels with an orthographic camera, so orthographic draws interpolate too (the
-  // perspective-only gate was for NSMBW, whose orthographic draws are only HUD).
-  return frame_interpolation_active();
+  // Orthographic draws interpolate too, not only perspective ones: a game can draw its levels with
+  // an orthographic camera.
+  // Motion vectors pair draws across frames with the same machinery.
+  return frame_interpolation_active() || gfx::motion_vectors_active();
 }
 
 static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
@@ -2095,17 +2136,22 @@ static HashType draw_geometry_signature(GXVtxFmt fmt, const uint8_t* vertices,
     }
   }
 
-  // Identical index streams can address different vertex arrays.
+  // Identical index streams can address different vertex arrays, so hash the positions they hold, not where they
+  // are: animated meshes (the manor curtains) are written to pooled buffers each frame, and the buffer one instance
+  // used last frame goes to another instance this frame. By address they matched the wrong instance exactly. By
+  // content, rewritten meshes fall back to the material identity, and identical copies are told apart by distance.
+  // Positions alone are enough: draws that differ only in other attributes pair by distance, which is all a pair is.
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
     if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
       continue;
     }
     const auto& array = g_gxState.arrays[i];
     const auto attribute = static_cast<uint32_t>(i);
-    const auto source = reinterpret_cast<uintptr_t>(array.data);
     hasher.update(attribute);
-    hasher.update(source);
     hasher.update(array.stride);
+    if (i == GX_VA_POS && array.data != nullptr) {
+      hasher.update(static_cast<const uint8_t*>(array.data), array.size);
+    }
   }
   return static_cast<HashType>(hasher.digest());
 }
@@ -2273,15 +2319,54 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
 }
 
 
-// SPM bring-up diagnostic: runtime sets g_spmDrawDump during the drawdump frame; g_spmCullOff forces GX_CULL_NONE.
-static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be);
-static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtxSize, const u8* v, bool be) {
+// Diagnostic: runtime sets g_gxDrawDump during the drawdump frame; g_gxCullOff forces GX_CULL_NONE.
+static void gx_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be);
+static float gx_bbox_comp(const u8* p, GXCompType t, u8 frac, bool be);
+static void gx_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtxSize, const u8* v, bool be) {
   static int n = 0;
-  if (!g_spmDrawDump || n++ > 30000) return;
-  spm_log_draw_extent(prim, static_cast<GXVtxFmt>(fmt), v, count, vtxSize, be);
+  if (!g_gxDrawDump || n++ > 6000) return;
+  gx_log_draw_extent(prim, static_cast<GXVtxFmt>(fmt), v, count, vtxSize, be);
+  static const unsigned vtxIdx = [] { const char* e = std::getenv("NO100F_VTX_IDX"); return e ? unsigned(std::atoi(e)) : ~0u; }();
+  if (((prim & 0xF8) == 0x90 || g_gxDrawIdx == vtxIdx) && v) {  // NO100F: raw bytes + layout (triangle lists, or draw NO100F_VTX_IDX)
+    std::string hex;
+    for (u32 i = 0; i < std::min<u32>(count * vtxSize, g_gxDrawIdx == vtxIdx ? 8192u : 96u); ++i) hex += fmt::format("{:02x}{}", v[i], (i + 1) % vtxSize ? "" : " |");
+    std::string desc;
+    for (int a = 0; a <= GX_VA_TEX7; ++a)
+      if (g_gxState.vtxDesc[a] != GX_NONE)
+        desc += fmt::format(" a{}={}/c{}t{}f{}", a, (int)g_gxState.vtxDesc[a], (int)g_gxState.vtxFmts[fmt].attrs[a].cnt,
+                            (int)g_gxState.vtxFmts[fmt].attrs[a].type, (int)g_gxState.vtxFmts[fmt].attrs[a].frac);
+    std::string clr;
+    const auto& ca = g_gxState.arrays[GX_VA_CLR0];
+    if (g_gxState.vtxDesc[GX_VA_CLR0] == GX_INDEX8 && ca.data && vtxSize >= 3) {
+      for (u32 i = 0; i < count && i < 12; ++i) {
+        const u32 idx = v[i * vtxSize + 2];  // pos, nrm, clr0 one byte each
+        if ((idx + 1) * ca.stride <= ca.size) {
+          const u8* c = static_cast<const u8*>(ca.data) + idx * ca.stride;
+          clr += fmt::format(" {:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]);
+        }
+      }
+    }
+    if (g_gxDrawIdx == vtxIdx) {  // every position this draw references, by index
+      const auto& pa = g_gxState.arrays[GX_VA_POS];
+      std::string ps;
+      u32 maxIdx = 0;
+      for (u32 i = 0; i < count; ++i) maxIdx = std::max<u32>(maxIdx, v[i * vtxSize]);
+      for (u32 idx = 0; idx <= maxIdx && pa.data; ++idx) {
+        if ((idx + 1) * pa.stride > pa.size) { ps += fmt::format(" [{} OOB]", idx); continue; }
+        float f[3];
+        for (int c = 0; c < 3; ++c) f[c] = gx_bbox_comp(static_cast<const u8*>(pa.data) + idx * pa.stride + c * 4, GX_F32, 0, !pa.le);
+        ps += fmt::format(" {}:{:.1f},{:.1f},{:.1f}", idx, f[0], f[1], f[2]);
+      }
+      Log.warn("[no100fpos] pos stride {} size {} maxIdx {} data {}{}", (int)pa.stride, pa.size, maxIdx, fmt::ptr(pa.data), ps);
+    }
+    const auto& ach = g_gxState.colorChannelConfig[GX_ALPHA0];
+    Log.warn("[no100fvtx] alpha0 mat {} amb {} lit {} | clr0 stride {} size {} le {}:{}", (int)ach.matSrc, (int)ach.ambSrc,
+             ach.lightingEnabled, (int)ca.stride, ca.size, ca.le, clr);
+    Log.warn("[no100fvtx] {} prim {:#x} n {} vsz {} be {} desc{} bytes {}", path, prim, count, vtxSize, be, desc, hex);
+  }
   float pm[16];
   std::memcpy(pm, &g_gxState.proj, sizeof(pm));
-  const u32 mi = g_gxState.currentPnMtx;  // already a slot (BP/CP value / 3)
+  const u32 mi = g_gxState.currentPnMtx / 3u;
   float mv[12] = {};
   if (mi < MaxPnMtx) std::memcpy(mv, &g_gxState.pnMtx[mi].pos, sizeof(mv));
   const auto& vp = g_gxState.renderViewport;
@@ -2307,7 +2392,7 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
         if (ar.data != nullptr && ar.size >= 16) {
           for (int i = 0; i < 16; ++i) std::snprintf(hex + i * 3, 4, "%02x ", static_cast<const u8*>(ar.data)[i]);
         }
-        Log.warn("[spmarr] attr {} desc {} fmt cnt {} type {} frac {} array size {} stride {} le {} first16 {}", static_cast<int>(at),
+        Log.warn("[gxarr] attr {} desc {} fmt cnt {} type {} frac {} array size {} stride {} le {} first16 {}", static_cast<int>(at),
                  static_cast<int>(g_gxState.vtxDesc[at]), static_cast<int>(af.cnt), static_cast<int>(af.type), static_cast<int>(af.frac), ar.size,
                  static_cast<int>(ar.stride), ar.le, hex);
       }
@@ -2347,15 +2432,15 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
       if (x1 - x0 > 0.5f && y1 - y0 > 0.3f) {  // wall-sized: log each vertex (index, ndc, clip w) and cull mode
         static int bigLogged = 0;
         for (u32 k = 0; k < count && k < 8 && bigLogged < 400; ++k, ++bigLogged)
-          Log.warn("[spmbig] v{} idx {} ndc {:.3f} {:.3f} {:.4f} w {:.2f} cull {} n {}", k, li[k], lv[k][0], lv[k][1], lv[k][2], lv[k][3],
+          Log.warn("[gxbig] v{} idx {} ndc {:.3f} {:.3f} {:.4f} w {:.2f} cull {} n {}", k, li[k], lv[k][0], lv[k][1], lv[k][2], lv[k][3],
                    (int)g_gxState.cullMode, count);
       }
       {  // per-draw state, to compare the missing wall with furniture that renders
         static int stLogged = 0;
         const auto& rv = g_gxState.renderViewport;
         const auto& rs = g_gxState.renderScissor;
-        if (stLogged++ < 30000)
-          Log.warn("[spmst] {} be {} frz {} {:.4f},{:.4f},{:.4f},{} cu {} au {} zc {} zf {} zu {} blend {} lop {} pn {} vp {:.0f},{:.0f} {:.0f}x{:.0f} z {:.2f}-{:.2f} sc {},{} {}x{} chans {} tg {} tev {} bbox {:.2f},{:.2f}..{:.2f},{:.2f}",
+        if (stLogged++ < 6000)
+          Log.warn("[gxst] {} be {} frz {} {:.4f},{:.4f},{:.4f},{} cu {} au {} zc {} zf {} zu {} blend {} lop {} pn {} vp {:.0f},{:.0f} {:.0f}x{:.0f} z {:.2f}-{:.2f} sc {},{} {}x{} chans {} tg {} tev {} bbox {:.2f},{:.2f}..{:.2f},{:.2f}",
                    path, be, g_gxState.zFreeze, g_gxState.zFreezePlane.x(), g_gxState.zFreezePlane.y(), g_gxState.zFreezePlane.z(), g_gxState.zFreezePlane.w(), g_gxState.colorUpdate, g_gxState.alphaUpdate, g_gxState.depthCompare, (int)g_gxState.depthFunc, g_gxState.depthUpdate, (int)g_gxState.blendMode,
                    (int)g_gxState.blendOp, g_gxState.currentPnMtx, rv.left, rv.top, rv.width, rv.height, rv.znear, rv.zfar, rs.x, rs.y,
                    rs.width, rs.height, g_gxState.numChans, g_gxState.numTexGens, g_gxState.numTevStages, x0, y0, x1, y1);
@@ -2367,12 +2452,12 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
         static std::set<const void*> dumped;
         if (to.data != nullptr && to.format() == 14 && dumped.size() < 40 && dumped.insert(to.data).second) {
           char fn[128];
-          std::snprintf(fn, sizeof(fn), "spmtex_%02zu_%ux%u_m%u.bin", dumped.size(), to.width(), to.height(), (unsigned)((to.mode0 >> 4) & 7));
+          std::snprintf(fn, sizeof(fn), "gxtex_%02zu_%ux%u_m%u.bin", dumped.size(), to.width(), to.height(), (unsigned)((to.mode0 >> 4) & 7));
           if (FILE* fp = std::fopen(fn, "wb")) { std::fwrite(to.data, 1, size_t(to.width()) * to.height() / 2 * 4 / 3 + 64, fp); std::fclose(fp); }
-          Log.warn("[spmtexdump] {} mode0 {:08x} mode1 {:08x} image0 {:08x}", fn, to.mode0, to.mode1, to.image0);
+          Log.warn("[gxtexdump] {} mode0 {:08x} mode1 {:08x} image0 {:08x}", fn, to.mode0, to.mode1, to.image0);
         }
       }
-      Log.warn("[spmq] n {} oob {} ndc {:.3f} {:.3f} {:.3f} {:.3f} z {:.4f} {:.4f} tex {} {}x{} f{} sum {} nz {} tlut {} zu {}", count, oobN, x0, y0, x1, y1, z0, z1,
+      Log.warn("[gxq] n {} oob {} ndc {:.3f} {:.3f} {:.3f} {:.3f} z {:.4f} {:.4f} tex {} {}x{} f{} sum {} nz {} tlut {} zu {}", count, oobN, x0, y0, x1, y1, z0, z1,
                to.data, to.width(), to.height(), to.format(), sum, nz, (int)to.tlut, g_gxState.depthUpdate);
     }
   }
@@ -2380,13 +2465,13 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
   const bool log98 = prim == 0x98 && tev98Logged < 4 && (++tev98Logged, true);
   if (log98) {
     const auto& ac = g_gxState.alphaCompare;
-    Log.warn("[spmtex] alpha comp0 {} ref0 {} op {} comp1 {} ref1 {} blend {} src {} dst {}", (int)ac.comp0, ac.ref0, (int)ac.op, (int)ac.comp1,
+    Log.warn("[gxtexuse] alpha comp0 {} ref0 {} op {} comp1 {} ref1 {} blend {} src {} dst {}", (int)ac.comp0, ac.ref0, (int)ac.op, (int)ac.comp1,
              ac.ref1, (int)g_gxState.blendMode, (int)g_gxState.blendFacSrc, (int)g_gxState.blendFacDst);
     for (int m = 0; m < 2; ++m) {
       const auto& to = g_gxState.loadedTextures[m];
       char hex[3 * 16 + 1] = {};
       if (to.data != nullptr) for (int i = 0; i < 16; ++i) std::snprintf(hex + i * 3, 4, "%02x ", static_cast<const u8*>(to.data)[i]);
-      Log.warn("[spmtex] map{} {}x{} fmt {} data {} wrap {} {} tlut {} first16 {}", m, to.width(), to.height(), to.format(), to.data,
+      Log.warn("[gxtexuse] map{} {}x{} fmt {} data {} wrap {} {} tlut {} first16 {}", m, to.width(), to.height(), to.format(), to.data,
                (int)to.wrap_s(), (int)to.wrap_t(), (int)to.tlut, hex);
     }
   }
@@ -2396,18 +2481,18 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
       float c0[4], c1[4];
       std::memcpy(c0, &g_gxState.colorRegs[1], sizeof(c0));
       std::memcpy(c1, &g_gxState.colorRegs[2], sizeof(c1));
-      Log.warn("[spmquadtex] map0 {} {}x{} fmt {} copy {} c0 {:.2f},{:.2f},{:.2f},{:.2f} c1 {:.2f},{:.2f},{:.2f},{:.2f}", to.data, to.width(),
+      Log.warn("[gxquadtex] map0 {} {}x{} fmt {} copy {} c0 {:.2f},{:.2f},{:.2f},{:.2f} c1 {:.2f},{:.2f},{:.2f},{:.2f}", to.data, to.width(),
                to.height(), to.format(), find_copy_texture_for_texobj(to) != nullptr, c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3]);
       static std::set<const void*> dumped;  // the quad's CMPR texture, for decoding offline
       if (to.data != nullptr && to.format() == 14 && to.width() >= 256 && dumped.size() < 8 && dumped.insert(to.data).second) {
         char fn[128];
-        std::snprintf(fn, sizeof(fn), "spmquad_%02zu_%ux%u.bin", dumped.size(), to.width(), to.height());
+        std::snprintf(fn, sizeof(fn), "gxquad_%02zu_%ux%u.bin", dumped.size(), to.width(), to.height());
         if (FILE* fp = std::fopen(fn, "wb")) { std::fwrite(to.data, 1, size_t(to.width()) * to.height() / 2, fp); std::fclose(fp); }
       }
     }
     for (u32 i = 0; i < g_gxState.numTevStages && i < 4; ++i) {
       const auto& t = g_gxState.tevStages[i];
-      Log.warn("[spmtev] st{} c {} {} {} {} op {} out {} cl {} sc {} | a {} {} {} {} op {} out {} | kc {} ka {} map {} coord {} chan {}", i,
+      Log.warn("[gxtev] st{} c {} {} {} {} op {} out {} cl {} sc {} | a {} {} {} {} op {} out {} | kc {} ka {} map {} coord {} chan {}", i,
                (int)t.colorPass.a, (int)t.colorPass.b, (int)t.colorPass.c, (int)t.colorPass.d, (int)t.colorOp.op,
                (int)t.colorOp.outReg, t.colorOp.clamp, (int)t.colorOp.scale, (int)t.alphaPass.a, (int)t.alphaPass.b,
                (int)t.alphaPass.c, (int)t.alphaPass.d, (int)t.alphaOp.op, (int)t.alphaOp.outReg, (int)t.kcSel, (int)t.kaSel,
@@ -2419,7 +2504,7 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
     std::memcpy(mat, &g_gxState.colorChannelState[0].matColor, sizeof(mat));
     std::memcpy(amb, &g_gxState.colorChannelState[0].ambColor, sizeof(amb));
     const auto& cc = g_gxState.colorChannelConfig[0];
-    Log.warn("[spmtev] regs prev {:.2f},{:.2f},{:.2f},{:.2f} r0 {:.2f},{:.2f},{:.2f},{:.2f} r1 {:.2f},{:.2f},{:.2f},{:.2f} r2 {:.2f},{:.2f},{:.2f},{:.2f} "
+    Log.warn("[gxtev] regs prev {:.2f},{:.2f},{:.2f},{:.2f} r0 {:.2f},{:.2f},{:.2f},{:.2f} r1 {:.2f},{:.2f},{:.2f},{:.2f} r2 {:.2f},{:.2f},{:.2f},{:.2f} "
              "k0 {:.2f},{:.2f},{:.2f},{:.2f} k1 {:.2f},{:.2f},{:.2f},{:.2f} mat {:.2f},{:.2f},{:.2f},{:.2f} amb {:.2f},{:.2f},{:.2f},{:.2f} "
              "chan0 mat {} amb {} lit {}",
              c[0][0], c[0][1], c[0][2], c[0][3], c[1][0], c[1][1], c[1][2], c[1][3], c[2][0], c[2][1], c[2][2], c[2][3], c[3][0],
@@ -2429,11 +2514,11 @@ static void spm_dump_draw(const char* path, u8 prim, u32 fmt, u32 count, u32 vtx
 }
 
 
-// SPM: GX's bounding box is filled by the rasterizer, which Aurora has no readback for. SPM reads it
-// after drawing offscreen objects (paper-flip effects, offscreen map objects, character extension
+// GX's bounding box is filled by the rasterizer, which Aurora has no readback for. A game reads it
+// after drawing offscreen objects (offscreen map objects, character extension
 // textures) to know what to copy, so while it is armed (GXClearBoundingBox until GXReadBoundingBox)
 // project every drawn position on the CPU with the raw XF projection/viewport, as the GPU would.
-static float spm_bbox_comp(const u8* p, GXCompType t, u8 frac, bool be) {
+static float gx_bbox_comp(const u8* p, GXCompType t, u8 frac, bool be) {
   auto rd16 = [&](const u8* q) { return be ? u16((q[0] << 8) | q[1]) : u16(q[0] | (q[1] << 8)); };
   const float scale = 1.f / float(1u << (frac & 31));
   switch (t) {
@@ -2451,8 +2536,8 @@ static float spm_bbox_comp(const u8* p, GXCompType t, u8 frac, bool be) {
   }
   }
 }
-static void spm_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
-  if (!g_spmBBoxArmed || !verts || vtxSize == 0) return;
+static void gx_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
+  if (!g_gxBBoxArmed || !verts || vtxSize == 0) return;
   const auto& pf = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
   const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
   if (pd == GX_NONE) return;
@@ -2473,8 +2558,8 @@ static void spm_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
     }
     const bool cbe = (pd == GX_DIRECT) ? be : !arr.le;
     float pos[3] = {0.f, 0.f, 0.f};
-    for (u32 c = 0; c < comps; ++c) pos[c] = spm_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
-    const u32 mi = (hasPnIdx ? v[0] / 3u : g_gxState.currentPnMtx);
+    for (u32 c = 0; c < comps; ++c) pos[c] = gx_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
+    const u32 mi = (hasPnIdx ? v[0] : g_gxState.currentPnMtx) / 3u;
     if (mi >= MaxPnMtx) continue;
     float m[12];
     std::memcpy(m, &g_gxState.pnMtx[mi].pos, sizeof(m));
@@ -2505,10 +2590,10 @@ static void spm_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
   }
 }
 
-// SPM diagnostic: every draw's extent in the game's own NDC (raw XF projection, unclamped, so |x| > 1
-// is outside the game's 16:9 view) during the dump frame. Same vertex walk as spm_bbox_accumulate.
+// Diagnostic: every draw's extent in the game's own NDC (raw XF projection, unclamped, so |x| > 1
+// is outside the game's 16:9 view) during the dump frame. Same vertex walk as gx_bbox_accumulate.
 // Extent of a draw in the game's own NDC (raw XF projection, unclamped); false when it has no position.
-static bool spm_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be, float out[4]) {
+static bool gx_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be, float out[4]) {
   const auto& pf = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
   const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
   if (!verts || vtxSize == 0 || pd == GX_NONE) return false;
@@ -2521,7 +2606,7 @@ static bool spm_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
   float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
   float mb[6] = {1e9f, 1e9f, 1e9f, -1e9f, -1e9f, -1e9f};  // model-space bbox, logged below
   float tri[3][2] = {};
-  for (u32 i = 0; i < count && i < 64; ++i) {
+  for (u32 i = 0; i < count && i < 4096; ++i) {
     const u8* v = verts + i * vtxSize;
     const u8* pp = v + pre;
     if (pd == GX_INDEX8 || pd == GX_INDEX16) {
@@ -2531,19 +2616,19 @@ static bool spm_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
     }
     const bool cbe = (pd == GX_DIRECT) ? be : !arr.le;
     float pos[3] = {0.f, 0.f, 0.f};
-    for (u32 c = 0; c < comps; ++c) pos[c] = spm_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
+    for (u32 c = 0; c < comps; ++c) pos[c] = gx_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
     for (int c = 0; c < 3; ++c) { mb[c] = std::min(mb[c], pos[c]); mb[c + 3] = std::max(mb[c + 3], pos[c]); }
-    const u32 mi = (hasPnIdx ? v[0] / 3u : g_gxState.currentPnMtx);
+    const u32 mi = (hasPnIdx ? v[0] : g_gxState.currentPnMtx) / 3u;
     if (mi >= MaxPnMtx) continue;
     float m[12];
     std::memcpy(m, &g_gxState.pnMtx[mi].pos, sizeof(m));
     const float vx = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
     const float vy = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
     const float vz = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
-    if (i == 0 && g_spmDrawDump) {
+    if (i == 0 && g_gxDrawDump) {
       static int mlog = 0;
       if (mlog++ < 6000)
-        Log.warn("[spmmtx] pn{} [{:.3f} {:.3f} {:.3f} {:.2f} | {:.3f} {:.3f} {:.3f} {:.2f} | {:.3f} {:.3f} {:.3f} {:.2f}] frac {} type {}", mi, m[0], m[1],
+        Log.warn("[gxmtx] pn{} [{:.3f} {:.3f} {:.3f} {:.2f} | {:.3f} {:.3f} {:.3f} {:.2f} | {:.3f} {:.3f} {:.3f} {:.2f}] frac {} type {}", mi, m[0], m[1],
                  m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], pf.frac, (int)pf.type);
     }
     float nx, ny, nz;
@@ -2563,12 +2648,12 @@ static bool spm_draw_ndc_extent(GXVtxFmt fmt, const u8* verts, u32 count, u32 vt
     if (i < 3) { tri[i][0] = nx; tri[i][1] = ny; }
   }
   out[0] = x0; out[1] = y0; out[2] = x1; out[3] = y1; out[4] = z0; out[5] = z1; out[6] = hasPnIdx ? 1.f : 0.f;
-  if (g_spmDrawDump) {
+  if (g_gxDrawDump) {
     static int blog = 0;
     // signed area of the first triangle in the game's NDC (y up): >0 = counter-clockwise
     const float area = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[2][0] - tri[0][0]) * (tri[1][1] - tri[0][1]);
     if (blog++ < 6000)
-      Log.warn("[spmmodel] {:.1f} {:.1f} {:.1f} .. {:.1f} {:.1f} {:.1f} | tri0 area {:.5f} cull {} proj y {:.4f} P {:.5f} {:.3f} {:.5f} {:.3f} {:.6f} {:.4f} vp {:.1f} {:.1f} {:.1f} {:.1f} {:.1f} {:.1f}",
+      Log.warn("[gxmodel] {:.1f} {:.1f} {:.1f} .. {:.1f} {:.1f} {:.1f} | tri0 area {:.5f} cull {} proj y {:.4f} P {:.5f} {:.3f} {:.5f} {:.3f} {:.6f} {:.4f} vp {:.1f} {:.1f} {:.1f} {:.1f} {:.1f} {:.1f}",
                mb[0], mb[1], mb[2], mb[3], mb[4], mb[5], area, (int)g_gxState.cullMode, P[2], P[0], P[1], P[2], P[3], P[4], P[5],
                g_gxState.xfViewport[0], g_gxState.xfViewport[1], g_gxState.xfViewport[2], g_gxState.xfViewport[3], g_gxState.xfViewport[4],
                g_gxState.xfViewport[5]);
@@ -2593,8 +2678,8 @@ static bool gx_vertex_ndc(GXVtxFmt fmt, const u8* v, bool be, float out[3]) {
   }
   const bool cbe = (pd == GX_DIRECT) ? be : !arr.le;
   float pos[3] = {0.f, 0.f, 0.f};
-  for (u32 c = 0; c < comps; ++c) pos[c] = spm_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
-  const u32 mi = (g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT ? v[0] / 3u : g_gxState.currentPnMtx);
+  for (u32 c = 0; c < comps; ++c) pos[c] = gx_bbox_comp(pp + c * compSize, pf.type, pf.frac, cbe);
+  const u32 mi = (g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT ? v[0] : g_gxState.currentPnMtx) / 3u;
   if (mi >= MaxPnMtx) return false;
   float m[12];
   std::memcpy(m, &g_gxState.pnMtx[mi].pos, sizeof(m));
@@ -2613,7 +2698,7 @@ static bool gx_vertex_ndc(GXVtxFmt fmt, const u8* v, bool be, float out[3]) {
     out[1] = P[2] * vy + P[3];
     out[2] = P[4] * vz + P[5];
   }
-  out[0] *= g_spmProjWiden;
+  out[0] *= g_gxProjWiden;
   return true;
 }
 
@@ -2652,24 +2737,24 @@ static void update_zfreeze_reference(GXPrimitive prim, GXVtxFmt fmt, const u8* v
   g_gxState.zFreezePlane = {A, B, a[2] - A * a[0] - B * a[1], 1.f};
 }
 
-static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
+static void gx_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
   static int logged = 0;
   float e[7];
-  if (logged++ > 30000 || !spm_draw_ndc_extent(fmt, verts, count, vtxSize, be, e)) return;
+  if (logged++ > 6000 || !gx_draw_ndc_extent(fmt, verts, count, vtxSize, be, e)) return;
   const float x0 = e[0], y0 = e[1], x1 = e[2], y1 = e[3];
   const std::string depth = fmt::format(" z {:.4f} {:.4f} pn {} cur {}", e[4], e[5], (int)e[6], g_gxState.currentPnMtx);
   const auto& to = g_gxState.loadedTextures[0];
   std::string tev;
   for (u32 i = 0; i < g_gxState.numTevStages && i < 4; ++i) {
     const auto& st = g_gxState.tevStages[i];
-    tev += fmt::format(" st{} c {} {} {} {} op {} bs {}/{}/{} out {} a {} {} {} {} map {} chan {} k {}", i, (int)st.colorPass.a, (int)st.colorPass.b,
-                       (int)st.colorPass.c, (int)st.colorPass.d, (int)st.colorOp.op, (int)st.colorOp.bias, (int)st.colorOp.scale, (int)st.colorOp.clamp, (int)st.colorOp.outReg, (int)st.alphaPass.a,
+    tev += fmt::format(" st{} c {} {} {} {} op {} out {} a {} {} {} {} map {} chan {} k {}", i, (int)st.colorPass.a, (int)st.colorPass.b,
+                       (int)st.colorPass.c, (int)st.colorPass.d, (int)st.colorOp.op, (int)st.colorOp.outReg, (int)st.alphaPass.a,
                        (int)st.alphaPass.b, (int)st.alphaPass.c, (int)st.alphaPass.d, (int)st.texMapId, (int)st.channelId, (int)st.kcSel);
   }
   const auto& cc = g_gxState.colorChannelConfig[0];
   {
     const auto& tg = g_gxState.tcgs[0];
-    Log.warn("[spmtcg] tg {} type {} src {} mtx {} norm {} post {} | indStages {} ind0 map {} coord {}", g_gxState.numTexGens, (int)tg.type,
+    Log.warn("[gxtcg] tg {} type {} src {} mtx {} norm {} post {} | indStages {} ind0 map {} coord {}", g_gxState.numTexGens, (int)tg.type,
              (int)tg.src, (int)tg.mtx, tg.normalize, (int)tg.postMtx, g_gxState.numIndStages, (int)g_gxState.indStages[0].texMapId,
              (int)g_gxState.indStages[0].texCoordId);
   }
@@ -2707,29 +2792,22 @@ static void spm_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 coun
             tbl += fmt::format("{:02x}{:02x}{:02x}{:02x} ", q[0], q[1], q[2], q[3]);
           }
           for (u32 b = 0; b < vtxSize * std::min<u32>(count, 4); ++b) raw += fmt::format("{:02x}{}", verts[b], (b + 1) % vtxSize == 0 ? " | " : " ");
-          Log.warn("[spmraw] desc p{} n{} c{} t{} vsz {} off {} table[0..7] {} verts {}", (int)g_gxState.vtxDesc[GX_VA_POS],
+          Log.warn("[gxraw] desc p{} n{} c{} t{} vsz {} off {} table[0..7] {} verts {}", (int)g_gxState.vtxDesc[GX_VA_POS],
                    (int)g_gxState.vtxDesc[GX_VA_NRM], (int)g_gxState.vtxDesc[GX_VA_CLR0], (int)g_gxState.vtxDesc[GX_VA_TEX0], vtxSize,
                    off, tbl, raw);
         }
       }
-      Log.warn("[spmclr] clr0 idx {} stride {} le {} bytes {:02x} {:02x} {:02x} {:02x} | arr {} size {} white {}/{} pos {} | k0 {:.2f},{:.2f},{:.2f},{:.2f} c0 {:.2f},{:.2f},{:.2f},{:.2f} mat {:.2f},{:.2f},{:.2f},{:.2f}",
+      Log.warn("[gxclr] clr0 idx {} stride {} le {} bytes {:02x} {:02x} {:02x} {:02x} | arr {} size {} white {}/{} pos {} | k0 {:.2f},{:.2f},{:.2f},{:.2f} c0 {:.2f},{:.2f},{:.2f},{:.2f} mat {:.2f},{:.2f},{:.2f},{:.2f}",
                idx, ca.stride, ca.le, cp[0], cp[1], cp[2], cp[3], ca.data, ca.size, white, entries, g_gxState.arrays[GX_VA_POS].data,
                k[0], k[1], k[2], k[3], c0[0], c0[1], c0[2], c0[3], mat[0], mat[1], mat[2], mat[3]);
     }
   }
-  Log.warn("[spmext] draw {} prim {:#x} fmt {} n {} ndc {:.3f} {:.3f} .. {:.3f} {:.3f}{} proj {} tex {}x{} f{} blend {} src {} dst {} zc {} zu {} zf {} tev {}{} chan0 mat {} amb {} lit {} clr0 desc {} type {} ac {} {} {} {} | chans {} a0src {} a0lit {} matA0 {:.3f} matA2 {:.3f} kA0 {} c1src {} c1lit {} c1mat {:.2f},{:.2f},{:.2f},{:.2f} a1src {} clr1desc {} cu {} au {} dstA {}",
-           g_spmAudit[0], prim, (int)fmt, count, x0, y0, x1, y1, depth, (int)g_gxState.projType, to.width(), to.height(), to.format(),
+  Log.warn("[gxext] widen {} sc {} idx {} draw {} prim {:#x} fmt {} n {} ndc {:.3f} {:.3f} .. {:.3f} {:.3f}{} proj {} tex {}x{} f{} blend {} src {} dst {} zc {} tev {}{} chan0 mat {} amb {} lit {} clr0 desc {} type {} ac {} {} {} {}", g_gxProjWiden, g_gxState.logicalScissor.width, g_gxDrawIdx,
+           g_gxAudit[0], prim, (int)fmt, count, x0, y0, x1, y1, depth, (int)g_gxState.projType, to.width(), to.height(), to.format(),
            (int)g_gxState.blendMode, (int)g_gxState.blendFacSrc, (int)g_gxState.blendFacDst, g_gxState.depthCompare,
-           g_gxState.depthUpdate, (int)g_gxState.depthFunc, g_gxState.numTevStages, tev, (int)cc.matSrc, (int)cc.ambSrc, cc.lightingEnabled, (int)g_gxState.vtxDesc[GX_VA_CLR0],
+           g_gxState.numTevStages, tev, (int)cc.matSrc, (int)cc.ambSrc, cc.lightingEnabled, (int)g_gxState.vtxDesc[GX_VA_CLR0],
            (int)g_gxState.vtxFmts[fmt].attrs[GX_VA_CLR0].type, (int)g_gxState.alphaCompare.comp0, g_gxState.alphaCompare.ref0,
-           (int)g_gxState.alphaCompare.comp1, g_gxState.alphaCompare.ref1, g_gxState.numChans,
-           (int)g_gxState.colorChannelConfig[GX_ALPHA0].matSrc, g_gxState.colorChannelConfig[GX_ALPHA0].lightingEnabled,
-           g_gxState.colorChannelState[0].matColor[3], g_gxState.colorChannelState[GX_ALPHA0].matColor[3],
-           (int)g_gxState.tevStages[0].kaSel, (int)g_gxState.colorChannelConfig[GX_COLOR1].matSrc,
-           g_gxState.colorChannelConfig[GX_COLOR1].lightingEnabled, g_gxState.colorChannelState[GX_COLOR1].matColor[0],
-           g_gxState.colorChannelState[GX_COLOR1].matColor[1], g_gxState.colorChannelState[GX_COLOR1].matColor[2],
-           g_gxState.colorChannelState[GX_COLOR1].matColor[3], (int)g_gxState.colorChannelConfig[GX_ALPHA1].matSrc,
-           (int)g_gxState.vtxDesc[GX_VA_CLR1], g_gxState.colorUpdate, g_gxState.alphaUpdate, g_gxState.dstAlpha);
+           (int)g_gxState.alphaCompare.comp1, g_gxState.alphaCompare.ref1);
 }
 
 static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t vertexBytes, bool merged = false) {
@@ -2744,7 +2822,64 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
     if (g_gxState.vtxDesc[i] == GX_INDEX8 || g_gxState.vtxDesc[i] == GX_INDEX16)  // uploaded every draw
       demand[3] += gfx::staging_storage_bytes(g_gxState.arrays[i].size);
   }
+  if (g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX8 || g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX16) {
+    // Motion vectors: last frame's copy of a CPU-animated model's positions, uploaded with the uniforms.
+    if (const uint32_t history = motion_vertex_history_bytes(g_gxState.arrays[GX_VA_POS].size); history != 0)
+      demand[3] += gfx::staging_storage_bytes(history);
+  }
   return gfx::staging_has_space(demand);
+}
+
+// Whether the world is drawn in order (solid scene, then its see-through draws): only while the scene stage
+// (scene_stage.hpp: ambient occlusion, bloom, its views) needs the point between the two.
+static bool world_ordering_enabled() noexcept { return gfx::scene_stage::wanted(); }
+
+// Whether a draw in the current state is part of the ordered world.
+static bool ordered_world_state() noexcept {
+  return world_ordering_enabled() && g_gxState.projType == GX_PERSPECTIVE &&
+         g_gxState.depthCompare && (g_gxState.depthFunc == GX_LESS || g_gxState.depthFunc == GX_LEQUAL);
+}
+
+// Whether a world draw (perspective) samples one of the game's light textures, for the bloom (gfx/bloom.hpp).
+static bool samples_light_texture(const ShaderInfo& info) noexcept {
+  if (!gfx::bloom::wanted() || g_gxState.projType != GX_PERSPECTIVE) {
+    return false;
+  }
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& bind = g_gxState.textures[i];
+    if (info.sampledTextures.test(i) && bind && gfx::bloom::is_light_texture(*bind.ref)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A surface as the scene stage's two-layer rule knows it: its geometry and position matrix.
+static HashType stage_surface(HashType geometrySignature) noexcept {
+  const auto& matrix = g_gxState.pnMtx[g_gxState.currentPnMtx].pos;
+  return xxh3_hash_s(&matrix, sizeof(matrix), geometrySignature);
+}
+
+static std::vector<float> direct_billboard_depths(GXPrimitive prim, GXVtxFmt fmt,
+                                                 const uint8_t* vertices, uint32_t vertexBytes) {
+  if (!world_ordering_enabled() || prim != GX_TRIANGLES || g_gxState.projType != GX_PERSPECTIVE ||
+      !g_gxState.depthCompare || g_gxState.depthUpdate ||
+      (g_gxState.depthFunc != GX_LESS && g_gxState.depthFunc != GX_LEQUAL) ||
+      g_gxState.blendMode != GX_BM_BLEND || g_gxState.blendFacSrc != GX_BL_SRCALPHA ||
+      g_gxState.blendFacDst != GX_BL_INVSRCALPHA || g_gxState.zFreeze ||
+      g_gxState.zTextureOp != GX_ZT_DISABLE || frame_interpolation_identity_needed() ||
+      g_gxState.currentPnMtx >= MaxPnMtx ||
+      g_gxState.renderViewport.znear > g_gxState.renderViewport.zfar) return {};
+  for (size_t attr = 0; attr < g_gxState.vtxDesc.size(); ++attr) {
+    const bool direct = attr == GX_VA_POS || attr == GX_VA_CLR0 || attr == GX_VA_TEX0;
+    if (g_gxState.vtxDesc[attr] != (direct ? GX_DIRECT : GX_NONE)) return {};
+  }
+  const auto& attrs = g_gxState.vtxFmts[fmt].attrs;
+  if (attrs[GX_VA_POS].cnt != GX_POS_XYZ || attrs[GX_VA_POS].type != GX_F32 ||
+      attrs[GX_VA_CLR0].cnt != GX_CLR_RGBA || attrs[GX_VA_CLR0].type != GX_RGBA8 ||
+      attrs[GX_VA_TEX0].cnt != GX_TEX_ST || attrs[GX_VA_TEX0].type != GX_F32) return {};
+  const auto& row = g_gxState.pnMtx[g_gxState.currentPnMtx].pos.m2;
+  return billboard_depths({vertices, vertexBytes}, {row[0], row[1], row[2], row[3]});
 }
 
 bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,
@@ -2772,7 +2907,7 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
 
   const u32 expectedVertexBytes = static_cast<u32>(vtxCount) * vtxSize;
   if (expectedVertexBytes == 0 || expectedVertexBytes != vertexBytes) {
-    ++g_spmAudit[1];
+    ++g_gxAudit[1];
     static uint32_t rawVertexSizeMismatchCount = 0;
     if (rawVertexSizeMismatchCount++ < 64) {
       Log.warn("raw draw vertex-size mismatch prim={} fmt={} count={} cached_stride={} expected={} supplied={}",
@@ -2782,9 +2917,9 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
     return false;
   }
 
-  ++g_spmAudit[0];
-  spm_dump_draw("raw", static_cast<u8>(prim | fmt), fmt, vtxCount, vtxSize, vertices, false);
-  spm_bbox_accumulate(fmt, vertices, vtxCount, vtxSize, true);
+  ++g_gxAudit[0];
+  gx_dump_draw("raw", static_cast<u8>(prim | fmt), fmt, vtxCount, vtxSize, vertices, false);
+  gx_bbox_accumulate(fmt, vertices, vtxCount, vtxSize, true);
   if (!has_complete_primitive(prim, vtxCount)) return true;
   if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, vertices, vtxCount, vtxSize, true);
 
@@ -2802,10 +2937,22 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
   const PnMtxUsage matrixUsage = interpolationIdentityActive
                                      ? pn_mtx_usage(vertices, vtxCount, vtxSize)
                                      : PnMtxUsage{};
-  handle_draw_unmerged(prim, fmt, vtxCount, vertRange,
-                       matrixUsage.mask, matrixUsage.topologySignature,
-                       interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
-                       interpolationIdentityActive);
+  if (g_gxProjWiden != 1.f && is_fullscreen_overlay_shape(prim, vtxCount)) {
+    float e[7];
+    const bool untextured = g_gxState.tevStages[0].texMapId == GX_TEXMAP_NULL;
+    // Full width and touching the top or bottom edge: fades and the cutscene letterbox bars. Textured, it must cover
+    // the whole screen and blend over it (the pause menu's dimming layer); opaque full-screen pictures keep 4:3.
+    g_rawFullscreenOverlay =
+        gx_draw_ndc_extent(fmt, vertices, vtxCount, vtxSize, true, e) && e[0] <= -0.99f && e[2] >= 0.99f &&
+        (untextured ? (e[1] <= -0.99f || e[3] >= 0.99f)
+                    : e[1] <= -0.99f && e[3] >= 0.99f && g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacSrc == GX_BL_SRCALPHA);
+  }
+  handle_draw_unmerged(prim, fmt, vtxCount, vertRange, matrixUsage.mask, matrixUsage.topologySignature,
+                       interpolationIdentityActive || gfx::scene_stage::wanted()
+                           ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize)
+                           : 0,
+                       interpolationIdentityActive, direct_billboard_depths(prim, fmt, vertices, vertexBytes));
+  g_rawFullscreenOverlay = false;
   return true;
 }
 
@@ -2834,73 +2981,19 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     return false;
   }
 
-
-  // A display list's vertex data cannot overlap a vertex array it indexes: stop the draw where a bound array
-  // begins. NO100F world lists declare sizes that run up to 31 bytes into the position array stored right
-  // after them (the CP fetches lists in 32-byte units, so hardware never reads them); a strip that read those
-  // bytes as 5 more vertices stretched an object in Mystic Manor into a slab across the courtyard. The
-  // declared bytes are still consumed so parsing stays in step.
-  struct TailSkip {
-    u32& pos;
-    u32 bytes = 0;
-    ~TailSkip() {
-      if (std::uncaught_exceptions() == 0) pos += bytes;  // a StagingBatchFull retry re-parses this draw
-    }
-  } tailSkip{pos};
-  if (g_replayingDisplayList) {
-    const u8* first = data + pos;
-    const u8* end = first + totalVtxBytes;
-    for (int a = GX_VA_POS; a <= GX_VA_TEX7; ++a) {
-      const auto* base = static_cast<const u8*>(g_gxState.arrays[a].data);
-      if ((g_gxState.vtxDesc[a] == GX_INDEX8 || g_gxState.vtxDesc[a] == GX_INDEX16) && base > first && base < end) end = base;
-    }
-    // The same overlap with a buffer that is not bound here (NO100F characters: the list's last 32-byte block is
-    // shared with the next allocation, so a strip's final vertices hold that buffer's floats): stop at a vertex in
-    // that block whose position index jumps past twice everything before it. Real geometry never does; those
-    // vertices threw a triangle across the screen from the character, different every frame.
-    const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
-    const u8* lastBlock = data + (size > 32 ? size - 32 : 0);
-    if ((pd == GX_INDEX8 || pd == GX_INDEX16) && end > lastBlock && vtxCount > 8) {
-      const u32 pre = matrix_index_prefix_size(fmt);
-      const auto posIdx = [&](const u8* v) {
-        return pd == GX_INDEX8 ? u32(v[pre]) : (bigEndian ? u32((v[pre] << 8) | v[pre + 1]) : u32(v[pre] | (v[pre + 1] << 8)));
-      };
-      const u32 tailStart = u32(std::max<std::ptrdiff_t>(0, (lastBlock - first + vtxSize - 1) / vtxSize));
-      u32 maxIdx = 0;
-      for (u32 i = 0; i < tailStart && i < vtxCount; ++i) maxIdx = std::max(maxIdx, posIdx(first + i * vtxSize));
-      for (u32 i = tailStart; tailStart >= 4 && i < u32(end - first) / vtxSize; ++i)
-        if (posIdx(first + i * vtxSize) > 2 * maxIdx + 16) { end = first + i * vtxSize; break; }
-    }
-    if (end != first + totalVtxBytes) UNLIKELY {
-      const u32 fetched = u32(end - first) / vtxSize;
-      const u32 unit = prim == GX_QUADS ? 4 : prim == GX_TRIANGLES ? 3 : prim == GX_LINES ? 2 : 1;
-      const u16 kept = static_cast<u16>(fetched - fetched % unit);
-      tailSkip.bytes = (vtxCount - kept) * vtxSize;
-      vtxCount = kept;
-      totalVtxBytes = kept * vtxSize;
+  ++g_gxAudit[0];
+  {  // NO100F: where the draw sits in its buffer (env NO100F_VTX_IDX, dump frame only)
+    static const unsigned vtxIdx = [] { const char* e = std::getenv("NO100F_VTX_IDX"); return e ? unsigned(std::atoi(e)) : ~0u; }();
+    if (g_gxDrawDump && g_gxDrawIdx == vtxIdx) {
+      std::string head, tail;
+      for (u32 i = 0; i < std::min<u32>(pos, 32); ++i) head += fmt::format("{:02x}", data[pos - std::min<u32>(pos, 32) + i]);
+      for (u32 i = pos + totalVtxBytes; i < std::min<u32>(size, pos + totalVtxBytes + 32); ++i) tail += fmt::format("{:02x}", data[i]);
+      Log.warn("[no100fdl] cmd {:#x} count {} vsz {} pos {} size {} after {} | before {} | after {}", cmd, vtxCount, vtxSize, pos,
+               size, size - pos - totalVtxBytes, head, tail);
     }
   }
-  ++g_spmAudit[0];
-  spm_dump_draw("fifo", cmd, fmt, vtxCount, vtxSize, data + pos, bigEndian);
-  spm_bbox_accumulate(fmt, data + pos, vtxCount, vtxSize, bigEndian);
-  // Dump-frame diagnostic: the first vertex colours of draws with an indexed CLR0 (alpha decides blending here).
-  if (g_spmDrawDump) {
-    const auto isz = [](GXAttrType t) { return t == GX_INDEX8 ? 1u : t == GX_INDEX16 ? 2u : 0u; };
-    const GXAttrType dp = g_gxState.vtxDesc[GX_VA_POS], dn = g_gxState.vtxDesc[GX_VA_NRM], dc = g_gxState.vtxDesc[GX_VA_CLR0];
-    const auto& ca = g_gxState.arrays[GX_VA_CLR0];
-    if (isz(dc) && isz(dp) && (dn == GX_NONE || isz(dn)) && ca.data && ca.stride) {
-      const u32 off = matrix_index_prefix_size(fmt) + isz(dp) + (dn == GX_NONE ? 0 : isz(dn));
-      std::string s;
-      for (u32 i = 0; i < std::min<u32>(vtxCount, 4); ++i) {
-        const u8* v = data + pos + i * vtxSize + off;
-        const u32 idx = dc == GX_INDEX8 ? v[0] : (bigEndian ? u32((v[0] << 8) | v[1]) : u32(v[0] | (v[1] << 8)));
-        if (u64(idx) * ca.stride + 4 > ca.size) break;
-        const u8* c = static_cast<const u8*>(ca.data) + idx * ca.stride;
-        s += fmt::format(" {:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]);
-      }
-      Log.warn("[spmclrv] draw {} n {} clr0{}", g_spmAudit[0], vtxCount, s);
-    }
-  }
+  gx_dump_draw("fifo", cmd, fmt, vtxCount, vtxSize, data + pos, bigEndian);
+  gx_bbox_accumulate(fmt, data + pos, vtxCount, vtxSize, bigEndian);
   // NO100F diagnostic (env NO100F_IDX_CHECK): position indices past the uploaded array, matrix indices past slot 9.
   if (static const bool idxCheck = std::getenv("NO100F_IDX_CHECK") != nullptr; idxCheck) {
     const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
@@ -2933,8 +3026,8 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
         pp = static_cast<const u8*>(arr.data) + idx * arr.stride;
       }
       const bool cbe = pd == GX_DIRECT ? bigEndian : true;  // guest arrays are big-endian
-      p.push_back({spm_bbox_comp(pp, pf.type, pf.frac, cbe), spm_bbox_comp(pp + cs, pf.type, pf.frac, cbe),
-                   spm_bbox_comp(pp + 2 * cs, pf.type, pf.frac, cbe)});
+      p.push_back({gx_bbox_comp(pp, pf.type, pf.frac, cbe), gx_bbox_comp(pp + cs, pf.type, pf.frac, cbe),
+                   gx_bbox_comp(pp + 2 * cs, pf.type, pf.frac, cbe)});
       pidx.push_back(idx);
     }
     if (p.size() >= 12) {
@@ -2967,39 +3060,41 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       std::fprintf(stderr, "[idxchk] prim=%d n=%u oob=%u badpn=%u maxidx=%u stride=%u size=%u dl=%d\n", (int)prim, (unsigned)vtxCount, oob,
                    badPn, maxIdx, (unsigned)arr.stride, (unsigned)arr.size, (int)g_replayingDisplayList);
   }
-  // Diagnostic (env SKIP_BLEND=<mode><src><dst>, e.g. 111 = additive, 145 = alpha): drop draws with that blend.
-  if (static const int skipBlend = [] { const char* e = std::getenv("SKIP_BLEND"); return e ? std::atoi(e) : -1; }();
-      skipBlend >= 0 && int(g_gxState.blendMode) * 100 + int(g_gxState.blendFacSrc) * 10 + int(g_gxState.blendFacDst) == skipBlend) {
-    pos += totalVtxBytes;
-    return true;
-  }
-  // Diagnostic (env SKIP_COPYQUAD=<texture format>): drop quads that sample an EFB copy of that format.
-  if (static const int skipCq = [] { const char* e = std::getenv("SKIP_COPYQUAD"); return e ? std::atoi(e) : -1; }();
-      skipCq >= 0 && prim == GX_QUADS && int(g_gxState.loadedTextures[0].format()) == skipCq &&
-      find_copy_texture_for_texobj(g_gxState.loadedTextures[0]) != nullptr) {
-    pos += totalVtxBytes;
-    return true;
-  }
   if (!has_complete_primitive(prim, vtxCount)) {
     pos += totalVtxBytes;
     return true;
   }
+  // NO100F diagnostic (env NO100F_SKIP_LINES): drop line draws, or with 2 log them.
+  if (static const int skipLines = [] { const char* e = std::getenv("NO100F_SKIP_LINES"); return e ? std::atoi(e) : 0; }();
+      skipLines && (prim == GX_LINES || prim == GX_LINESTRIP)) {
+    if (static int n = 0; skipLines == 2 && n++ < 50) std::fprintf(stderr, "[line] prim=%d n=%u width=%u\n", (int)prim, (unsigned)vtxCount, (unsigned)g_gxState.lineWidth);
+    if (skipLines == 1) { pos += totalVtxBytes; return true; }
+  }
   if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);
-  // SPM: with the view widened past 16:9, a quad covering the game's whole 16:9 view (backdrop colour,
+  // With the view widened past 16:9, a quad covering the game's whole 16:9 view (backdrop colour,
   // sky, fade curtains) is drawn unwidened so it covers the whole screen instead of leaving the
   // margins black; the camera widening still applies to everything else.
   bool fullScreenQuad = false;
-  if (g_spmProjWiden != 1.f && prim == GX_QUADS && vtxCount == 4) {
+  if (g_gxProjWiden != 1.f && is_fullscreen_overlay_shape(prim, vtxCount)) {
     float e[7];
-    fullScreenQuad = spm_draw_ndc_extent(fmt, data + pos, vtxCount, vtxSize, bigEndian, e) && e[0] <= -0.99f &&
-                     e[1] <= -0.99f && e[2] >= 0.99f && e[3] >= 0.99f;
+    fullScreenQuad = gx_draw_ndc_extent(fmt, data + pos, vtxCount, vtxSize, bigEndian, e) && e[0] <= -0.99f &&
+                     e[2] >= 0.99f && (e[1] <= -0.99f && e[3] >= 0.99f ||
+                     // untextured full-width bars at the top or bottom edge (cutscene letterbox)
+                     g_gxState.tevStages[0].texMapId == GX_TEXMAP_NULL && (e[1] <= -0.99f || e[3] >= 0.99f));
+    // NO100F draws fades as strips / triangle lists; only untextured ones stretch (pictures keep their 4:3 shape).
+    if (prim != GX_QUADS && g_gxState.tevStages[0].texMapId != GX_TEXMAP_NULL) fullScreenQuad = false;
     if (fullScreenQuad) g_gxState.stateDirty = true;  // its projection differs from its neighbours': never merge
   }
+  if (!fullScreenQuad && skip_hor_plus_widen()) {
+    fullScreenQuad = true;  // drawn with the unwidened projection, never merged (see skip_hor_plus_widen)
+    g_gxState.stateDirty = true;
+  }
 
+  const auto particleDepths = direct_billboard_depths(prim, fmt, data + pos, totalVtxBytes);
   DrawData* mergeTarget = nullptr;
-  // NSMBW debugging: NSMBW_NO_MERGE turns draw merging off.
+  // Debugging: NO100F_NO_MERGE turns draw merging off.
   static const int noMergeMode = [] {
-    const char* v = std::getenv("NSMBW_NO_MERGE");
+    const char* v = std::getenv("NO100F_NO_MERGE");
     return v == nullptr ? 0 : std::atoi(v);
   }();
   // 1: never merge; 2: not while drawing into the EFB below line 456 (light textures, tile frames);
@@ -3010,7 +3105,7 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   // Decide admission before allocating anything. The merged path needs only
   // vertices and indices; it must not resolve pipelines or upload arrays.
   // Try to merge with previous draw call
-  if (!g_gxState.stateDirty && !noMerge) LIKELY {
+  if (!g_gxState.stateDirty && !noMerge && particleDepths.empty()) LIKELY {
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     // Expanded lines/points have different vertex interpretation even with one instance.
     // Triangle-list output has no restart index; index 65535 is usable.
@@ -3055,6 +3150,11 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       lastDraw->vtxCount += vtxCount;
       lastDraw->indexCount += numIndices;
       ++gfx::g_mergedDrawCallCount;
+      // Merged into a solid draw (a see-through draw never takes more): it is a solid surface of its own, whose second
+      // layer has to be recognised like any other's.
+      if (g_gxState.depthUpdate && ordered_world_state() && gfx::scene_stage::wanted()) {
+        gfx::scene_stage::note_solid_surface(stage_surface(draw_geometry_signature(fmt, vertices, vtxCount, vtxSize)));
+      }
       // This primitive now renders through the draw we merged into, so its palette slots belong to that draw's interpolation snapshot as well.
       if (s_lastDrawRecordedInterpolation) UNLIKELY {
         extend_interpolation_draw(pn_mtx_mask(vertices, vtxCount, vtxSize));
@@ -3072,10 +3172,11 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     g_gxState.proj.m0[0] = raw[0];
     (g_gxState.projType == GX_ORTHOGRAPHIC ? g_gxState.proj.m0[3] : g_gxState.proj.m0[2]) = raw[1];
   }
-  handle_draw_unmerged(prim, fmt, vtxCount, vertRange,
-                       matrixUsage.mask, matrixUsage.topologySignature,
-                       interpolationIdentityActive ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize) : 0,
-                       interpolationIdentityActive);
+  handle_draw_unmerged(prim, fmt, vtxCount, vertRange, matrixUsage.mask, matrixUsage.topologySignature,
+                       interpolationIdentityActive || gfx::scene_stage::wanted()
+                           ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize)
+                           : 0,
+                       interpolationIdentityActive, particleDepths);
   if (fullScreenQuad) {
     g_gxState.proj = widenedProj;
     g_gxState.stateDirty = true;
@@ -3083,21 +3184,81 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   return true;
 }
 
+}  // namespace (fifo)
+namespace aurora::gx {
+// NO100F: render-to-texture work skips the Hor+ widening: draws limited to a small viewport or scissor (the shadow
+// pass renders Scooby in a 256x256 corner; the shadow receivers project that texture as the game set it up), 2D
+// draws blending with the destination colour, and 2D draws pasting an EFB copy back (the corner restore must land
+// on the pixels it was copied from).
+bool skip_hor_plus_widen() noexcept {
+  if (fifo::g_gxProjWiden == 1.f) return false;
+  if (g_rawFullscreenOverlay) return true;
+  if (g_gxState.logicalViewport.width < 400.0f || g_gxState.logicalScissor.width < 400) return true;
+  if (g_gxState.projType != GX_ORTHOGRAPHIC) return false;
+  // A 2D draw blending with the destination colour is a framebuffer effect on exact pixels (the shadow pass's
+  // invert quad over its corner).
+  if (g_gxState.blendMode == GX_BM_BLEND && (g_gxState.blendFacSrc == GX_BL_DSTCLR || g_gxState.blendFacSrc == GX_BL_INVDSTCLR))
+    return true;
+  return is_recent_copy_dest(g_gxState.loadedTextures[0]);
+}
+}  // namespace aurora::gx
+namespace aurora::gx::fifo {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
-                                 HashType geometrySignature, bool interpolationIdentityActive) {
+                                 HashType geometrySignature, bool interpolationIdentityActive,
+                                 std::span<const float> particleDepths) {
   ZoneScoped;
-  if (g_spmDrawLimit != ~0u && g_spmDrawIdx++ >= g_spmDrawLimit) return;
+  if (g_gxDrawLimit != ~0u && g_gxDrawIdx++ >= g_gxDrawLimit) return;
+  // NO100F diagnostic (env NO100F_SKIP_DRAWS=a-b): skip draws a..b of every frame to bisect a bad draw (use NO100F_NO_MERGE=1).
+  static const std::pair<unsigned, unsigned> skipDraws = [] {
+    unsigned a = ~0u, b = 0;
+    if (const char* e = std::getenv("NO100F_SKIP_DRAWS")) std::sscanf(e, "%u-%u", &a, &b);
+    return std::pair{a, b};
+  }();
+  if (skipDraws.first != ~0u) {
+    const unsigned i = g_gxDrawIdx++;
+    if (i >= skipDraws.first && i <= skipDraws.second) return;
+  }
+  // NO100F diagnostic (env NO100F_SHADOW_TEST): 1 = skip the shadow receiver (blend ZERO / INV_SRC_COLOR),
+  // 2 = skip ortho draws textured with a 256x256 RGBA8 (restore of the EFB corner the shadow is rendered in).
+  static const int shadowTest = [] { const char* e = std::getenv("NO100F_SHADOW_TEST"); return e ? std::atoi(e) : 0; }();
+  if (shadowTest == 1 && g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacSrc == GX_BL_ZERO &&
+      g_gxState.blendFacDst == GX_BL_INVSRCCLR)
+    return;
+  if (shadowTest == 2 && g_gxState.projType == GX_ORTHOGRAPHIC && g_gxState.loadedTextures[0].width() == 256 &&
+      g_gxState.loadedTextures[0].height() == 256 && g_gxState.loadedTextures[0].format() == GX_TF_RGBA8)
+    return;
+  // NO100F: render-to-texture work skips the Hor+ widening: draws limited to a small viewport or scissor (the
+  // shadow pass renders and inverts Scooby in a 256x256 corner under GXSetScissor, partly with the 640x480 2D
+  // projection; the shadow receivers project that texture as the game set it up) and 2D
+  // draws that paste an EFB copy back (the corner restore must land on the pixels it was copied from).
+  struct CopyPasteUnwiden {
+    bool on = false;
+    Mat4x4<float> saved{};
+    CopyPasteUnwiden() {
+      if (!skip_hor_plus_widen()) return;
+      on = true;
+      saved = g_gxState.proj;
+      g_gxState.proj.m0[0] = g_gxState.xfProjection[0];
+      (g_gxState.projType == GX_ORTHOGRAPHIC ? g_gxState.proj.m0[3] : g_gxState.proj.m0[2]) = g_gxState.xfProjection[1];
+      g_gxState.stateDirty = true;
+    }
+    ~CopyPasteUnwiden() {
+      if (!on) return;
+      g_gxState.proj = saved;
+      g_gxState.stateDirty = true;
+    }
+  } copyPasteUnwiden;
   // GX_CULL_ALL rasterizes nothing on hardware - no color, no depth.
   if (g_gxState.cullMode == GX_CULL_ALL && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS)
       UNLIKELY {
     // Leave stateDirty alone: the next draw re-resolving its pipeline is the safe direction, and nothing about this draw reached the GPU.
     return;
   }
-  // SPM diagnostic (env SPM_FLAT_TEST): map-tile class (fmt0 strips, CMPR map0) drawn 1 = flat white, 2 = flat white over
+  // Diagnostic (env NO100F_FLAT_TEST): map-tile class (fmt0 strips, CMPR map0) drawn 1 = flat white, 2 = flat white over
   // everything (no depth), 3 = texture colour only, 4 = every draw flat white, 5 = every non-quad draw flat white (quads = backdrop/HUD), 6 = depth-tested quads white, 7 = 2 + culling off, 10 = 7 + fixed z -0.95. Shows whether missing walls/floors rasterize at all.
-  static const int flatTest = [] { const char* e = std::getenv("SPM_FLAT_TEST"); return e ? std::atoi(e) : 0; }();
+  static const int flatTest = [] { const char* e = std::getenv("NO100F_FLAT_TEST"); return e ? std::atoi(e) : 0; }();
   struct FlatSave { TevStage st0; u8 numTev; AlphaCompare ac; GXBlendMode bm; bool dc, du; GXCullMode cull; Mat4x4<float> proj; };
   std::optional<FlatSave> flatSave;
   if (flatTest == 8) for (auto& a : g_gxState.arrays) a.cachedRange = {};  // 8 = re-upload vertex arrays every draw
@@ -3126,44 +3287,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     st.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
     g_gxState.pipelineStateGeneration = next_gx_state_epoch();
   }
-  // 20 = additive (ONE,ONE) draws output a constant 1/8 grey and everything else black: brightness = additive layer count.
-  if (flatTest == 20) {
-    flatSave = FlatSave{g_gxState.tevStages[0], g_gxState.numTevStages, g_gxState.alphaCompare, g_gxState.blendMode,
-                        g_gxState.depthCompare, g_gxState.depthUpdate, g_gxState.cullMode, g_gxState.proj};
-    const bool additive = g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacSrc == GX_BL_ONE && g_gxState.blendFacDst == GX_BL_ONE;
-    auto& st = g_gxState.tevStages[0];
-    st.colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, additive ? GX_CC_KONST : GX_CC_ZERO};
-    st.kcSel = GX_TEV_KCSEL_1_8;
-    st.alphaPass = {GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST};
-    st.kaSel = GX_TEV_KASEL_1;
-    st.colorOp = {};
-    st.alphaOp = {};
-    g_gxState.numTevStages = 1;
-    g_gxState.alphaCompare = {};
-    g_gxState.pipelineStateGeneration = next_gx_state_epoch();
-  }
-  // 21 = every draw opaque in a colour encoding its [spmext] draw number (r = low byte), depth as the game set it:
-  // a screenshot pixel names the draw that last wrote it. Use with NSMBW_NO_MERGE=1.
-  static Vec4<float> flatK0;
-  if (flatTest == 21) {
-    flatSave = FlatSave{g_gxState.tevStages[0], g_gxState.numTevStages, g_gxState.alphaCompare, g_gxState.blendMode,
-                        g_gxState.depthCompare, g_gxState.depthUpdate, g_gxState.cullMode, g_gxState.proj};
-    flatK0 = g_gxState.kcolors[0];
-    const u32 id = g_spmAudit[0];
-    g_gxState.kcolors[0] = {float(id & 0xFF) / 255.f, float((id >> 8) & 0xFF) / 255.f, float((id >> 16) & 0xFF) / 255.f, 1.f};
-    auto& st = g_gxState.tevStages[0];
-    st.colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST};
-    st.kcSel = GX_TEV_KCSEL_K0;
-    st.alphaPass = {GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST};
-    st.kaSel = GX_TEV_KASEL_1;
-    st.colorOp = {};
-    st.alphaOp = {};
-    g_gxState.numTevStages = 1;
-    g_gxState.blendMode = GX_BM_NONE;
-    g_gxState.pipelineStateGeneration = next_gx_state_epoch();
-  }
   if (flatTest == 4 || (flatTest == 5 && prim != GX_QUADS) || (flatTest == 6 && prim == GX_QUADS && g_gxState.depthCompare) ||
-      (flatTest != 0 && flatTest != 20 && prim == GX_TRIANGLESTRIP && fmt == GX_VTXFMT0 && g_gxState.loadedTextures[0].format() == GX_TF_CMPR)) {
+      (flatTest != 0 && prim == GX_TRIANGLESTRIP && fmt == GX_VTXFMT0 && g_gxState.loadedTextures[0].format() == GX_TF_CMPR)) {
     flatSave = FlatSave{g_gxState.tevStages[0], g_gxState.numTevStages, g_gxState.alphaCompare, g_gxState.blendMode,
                         g_gxState.depthCompare, g_gxState.depthUpdate, g_gxState.cullMode, g_gxState.proj};
     auto& st = g_gxState.tevStages[0];
@@ -3193,28 +3318,17 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) {
       continue;
     }
-    // Upload every draw's arrays as they are in RAM now, like the GPU reading memory. Games rewrite arrays at the
-    // same address between draws (CPU-animated models), so reusing an earlier upload of that address drew models with
-    // another moment's vertices.
+    // NO100F: upload every draw's arrays as they are in RAM now, like the GPU reading memory. The game rewrites
+    // arrays at the same address between draws (CPU-animated models), so reusing an earlier upload of the same
+    // address drew models with another moment's vertices (spikes, stretched slabs). It is faster here, too.
     auto& array = g_gxState.arrays[i];
-    // A/B diagnostic (env ARRAY_REUSE=1): the old behaviour, reusing this staging epoch's upload of the same address.
-    static const bool reuse = std::getenv("ARRAY_REUSE") != nullptr;
-    static absl::flat_hash_map<const void*, std::pair<gfx::Range, u32>> s_staged;
-    static u32 s_stagedEpoch = 0;
-    if (reuse && s_stagedEpoch != g_arrayUploadEpoch) { s_staged.clear(); s_stagedEpoch = g_arrayUploadEpoch; }
-    if (const auto it = s_staged.find(array.data); reuse && it != s_staged.end() && it->second.second >= array.size) {
-      array.cachedRange = it->second.first;
-    } else {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-      if (reuse) s_staged[array.data] = {array.cachedRange, array.size};
-    }
+    array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
     ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
   }
 
   const auto& pipelineState = resolve_pipeline_state(prim, fmt);
+  resolve_sampled_textures(pipelineState.shaderInfo);
   const auto& info = pipelineState.shaderInfo;
-
-  resolve_sampled_textures(info);
 
   const auto bindGroups = build_bind_groups(info);
 
@@ -3251,7 +3365,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   } else if (prim == GX_POINTS) {
     instanceCount = vtxCount;
   }
-  gfx::push_draw_command(DrawData{
+  DrawData draw{
       .pipeline = pipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
@@ -3263,8 +3377,56 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       .expandedPrimitive = prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS,
       .bindGroups = bindGroups,
       .dstAlpha = pipelineState.dstAlpha,
-  });
-  g_gxState.stateDirty = false;
+      .emitsLight = samples_light_texture(info),
+  };
+  const bool orderedWorld = ordered_world_state();
+  // The game also draws blended surfaces after its particles with depth write on and no alpha test, such as the faded
+  // door and wall pieces between the camera and the room at the start of i004. They keep that place in the tail: drawn
+  // earlier, their depth would hide every translucent draw behind them, even at alpha 0.
+  const bool lateBlendedSurface = orderedWorld && g_gxState.depthUpdate && g_gxState.blendMode == GX_BM_BLEND &&
+                                  g_gxState.alphaCompare.comp0 == GX_ALWAYS &&
+                                  g_gxState.alphaCompare.comp1 == GX_ALWAYS && gfx::has_pending_translucent_draws();
+  const bool translucentWorld = orderedWorld && (!g_gxState.depthUpdate || lateBlendedSurface);
+  // With the scene stage in use, a see-through draw of a surface already drawn solid this frame (the game's two-layer
+  // materials) is the solid surface's second layer: it is drawn after the solid scene, before the stage, instead of
+  // in the see-through tail. Late blended surfaces (which write depth) stay in the tail.
+  bool surfaceLayer = false;
+  if (orderedWorld && geometrySignature != 0 && particleDepths.empty() && gfx::scene_stage::wanted()) {
+    const HashType surface = stage_surface(geometrySignature);
+    if (!translucentWorld && g_gxState.depthUpdate) {
+      gfx::scene_stage::note_solid_surface(surface);
+    } else if (translucentWorld && !lateBlendedSurface) {
+      surfaceLayer = gfx::scene_stage::is_solid_surface(surface);
+    }
+  }
+  // Anything outside the ordered world (2D, no depth test) ends the world: its solid scene, the stage and its
+  // see-through tail are drawn first.
+  if (!orderedWorld && world_ordering_enabled()) {
+    gfx::flush_deferred_draws();
+  }
+  // Retain submission order within the translucent tail.
+  if (surfaceLayer) {
+    gfx::push_deferred_draw_command(draw, gfx::DeferredDrawKind::SurfaceLayer);
+  } else if (translucentWorld) {
+    if (!particleDepths.empty()) {
+      const auto& matrix = g_gxState.pnMtx[g_gxState.currentPnMtx].pos;
+      const HashType group = xxh3_hash_s(&g_gxState.proj, sizeof(g_gxState.proj),
+                                        xxh3_hash_s(&matrix, sizeof(matrix)));
+      draw.particleSortGroup = group == 0 ? 1 : group;
+      draw.indexCount = 6;
+      // Reuse the original vertices, uniforms and absolute indices; only the six-index view changes.
+      for (size_t quad = 0; quad < particleDepths.size(); ++quad) {
+        draw.idxRange = {idxRange.offset + static_cast<uint32_t>(quad * 6 * sizeof(u16)), 6 * sizeof(u16)};
+        draw.particleDepth = particleDepths[quad];
+        gfx::push_deferred_draw_command(draw, gfx::DeferredDrawKind::Translucent);
+      }
+    } else {
+      gfx::push_deferred_draw_command(draw, gfx::DeferredDrawKind::Translucent);
+    }
+  } else {
+    gfx::push_draw_command(draw);
+  }
+  g_gxState.stateDirty = translucentWorld;
   if (flatSave) {
     g_gxState.tevStages[0] = flatSave->st0;
     g_gxState.numTevStages = flatSave->numTev;
@@ -3274,7 +3436,6 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     g_gxState.depthUpdate = flatSave->du;
     g_gxState.cullMode = flatSave->cull;
     g_gxState.proj = flatSave->proj;
-    if (flatTest == 21) g_gxState.kcolors[0] = flatK0;
     g_gxState.pipelineStateGeneration = next_gx_state_epoch();
     g_gxState.stateDirty = true;
   }
@@ -3444,7 +3605,7 @@ bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
 
 } // namespace aurora::gx::fifo
 
-// NSMBW: widen 16:9 perspective cameras to `aspect` (the screen's, when wider than 16:9; 0 = off).
+// Widen 16:9 perspective cameras to `aspect` (the screen's, when wider than 16:9; 0 = off).
 extern std::atomic<uint64_t> g_statCopies, g_statCopyCreates;
 extern "C" void AuroraTakeCopyStats(uint64_t* copies, uint64_t* creates) {
   *copies = g_statCopies.exchange(0, std::memory_order_relaxed);
@@ -3466,7 +3627,7 @@ extern "C" void AuroraSetWidePerspectiveAspect(float aspect) {
 }
 
 // Decoded vertex descriptor/format state, so the runtime can mirror changes a host display list made.
-extern "C" void aurora_spm_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3) {
+extern "C" void aurora_gx_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3) {
   using namespace aurora::gx;  // defined outside the namespace for C linkage
   for (int a = 0; a < 26 && a < int(MaxVtxAttr); ++a) desc26[a] = static_cast<uint8_t>(g_gxState.vtxDesc[a]);
   for (int f = 0; f < 8; ++f)

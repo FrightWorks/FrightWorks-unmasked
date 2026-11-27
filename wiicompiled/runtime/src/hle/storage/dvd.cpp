@@ -3,6 +3,7 @@
 #include "hle/dvd_contract.h"
 #include "hle/runtime_parse_helpers.h"
 #include "memory.h"
+#include "no100f_game_state.h"
 
 // Defined in hle/gx/gx_objects.cpp. DVD reads are DMA-class writes to guest
 // RAM: the game brackets them with DCInvalidateRange (not a flush), so the GX
@@ -980,7 +981,7 @@ extern "C" void DVDInit_8015EA1C()
     ScanDirectory(rootPath / "sys", "/sys/");
 
     const auto& overlays = RuntimeRiivolution::Overlays();
-    if (overlays.empty() && RuntimeProduct::IsRetroRewind()) {
+    if (overlays.empty() && RuntimeProduct::IsModProduct()) {
         RT_LOG(RT_TAG_DVD) << "WARNING: no Retro Rewind overlay root was found. "
                      "File replacements (menu archives, karts, drivers, courses) will not apply "
                      "and the game will look and play like the unmodded disc. Set "
@@ -1087,6 +1088,13 @@ extern "C" int32_t DVDReadPrio_8015E834(uint32_t fileInfoPtr, uint32_t bufferPtr
                             DvdReadContract::Describe(failure));
     }
 
+    // A movie's first read (Bink header): note whether it is the credits, for the credits pill (settings_overlay), and
+    // its name for the log's movie and hang lines (vi.cpp).
+    if (uOffset == 0 && uLength >= 3 && std::memcmp(tempBuf.data(), "BIK", 3) == 0) {
+        const std::string movieName = entry.hostPath.filename().string();
+        no100f_game_state::g_creditsMovie.store(no100f_game_state::IsCreditsMovie(movieName), std::memory_order_relaxed);
+        no100f_game_state::SetLastMovieName(movieName);
+    }
     SkipIntroMovie(entry.hostPath, uOffset, tempBuf);
     CopyToGuestAsDma(bufferPtr, tempBuf.data(), uLength);
 

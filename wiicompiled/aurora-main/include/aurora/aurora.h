@@ -38,6 +38,13 @@ typedef enum {
   AURORA_DISPLAY_MODE_EXCLUSIVE,
 } AuroraDisplayMode;
 
+// A connected monitor for choosing where fullscreen goes. id survives reboots and display renumbering.
+typedef struct {
+  char id[128];
+  char label[256];  // name, size and place: "VS248 (1920x1080, above right)"
+  bool selected;    // what aurora_set_fullscreen_monitor's id currently resolves to
+} AuroraMonitor;
+
 typedef struct {
   int32_t x;
   int32_t y;
@@ -102,6 +109,16 @@ typedef struct {
   bool pauseOnFocusLost;
   bool allowTextureReplacements;
   bool allowTextureDumps;
+  // A texture folder indexed after all the others (the player's Xbox textures), so every other folder wins. With
+  // extraTexturesOnly it is the only folder indexed (the HD pack and the user's own are off). Null for none.
+  const char* extraTexturePath;
+  bool extraTexturesOnly;
+  // Redraw the game's font sheets at a high resolution as they load (lib/gfx/sharp_font.hpp), ahead of the built-in
+  // HD pack; works with texture replacement off.
+  bool sharpFont;
+  // Redraw the flat pause menu and map icons at a high resolution as they load (lib/gfx/sharp_font.hpp), only where
+  // no replacement file exists: the HD pack keeps its icons.
+  bool sharpIcons;
   bool disableCopyFilter;
   // When false, Aurora centers the first window. When true, windowPosX/Y are restored verbatim,
   // including negative coordinates on monitors left of or above the primary display.
@@ -135,6 +152,12 @@ typedef struct {
   const char* pipelineCachePath;
 
   AuroraGpuCompat gpuCompat;
+  // Motion blur at start (see aurora_set_motion_blur); 0 = off.
+  float motionBlur;
+  // Ambient occlusion at start (see aurora_set_ambient_occlusion); 0 = off.
+  float ambientOcclusion;
+  // Bloom at start (see aurora_set_bloom); 0 = off.
+  float bloom;
 } AuroraConfig;
 
 typedef enum {
@@ -174,6 +197,31 @@ void aurora_set_present_schedule(uint64_t baseNanos, uint64_t intervalNanos);
 // slot group from this, backing off after misses. Only paced presents may report.
 void aurora_report_producer_paced(bool paced);
 void aurora_request_frame_capture(uint32_t frame, const char* outputPath);
+// Saves the next presented frame as a PNG at outputPath (UTF-8), encoded on a worker thread: the game frame without
+// the ImGui overlay, or as aurora_set_capture_overlay says. Replaces a capture still waiting for its frame.
+void aurora_request_screenshot(const char* outputPath);
+// Outcome of the last screenshot: 1 saved, -1 failed, 0 nothing new. Reading it clears it.
+int aurora_take_screenshot_result(void);
+// What screenshots and video frames show of the ImGui overlay. NONE: screenshots are the game frame at its render size
+// (the default). STAMP / ALL: the window's picture (game scaled as on screen) with only the ImGui window named
+// AURORA_CAPTURE_STAMP_WINDOW on top / with every ImGui window. The window named AURORA_CAPTURE_HIDDEN_WINDOW is never
+// captured (an on-screen recording light).
+typedef enum {
+  AURORA_CAPTURE_OVERLAY_NONE = 0,
+  AURORA_CAPTURE_OVERLAY_STAMP = 1,
+  AURORA_CAPTURE_OVERLAY_ALL = 2,
+} AuroraCaptureOverlay;
+#define AURORA_CAPTURE_STAMP_WINDOW "##CaptureStamp"
+#define AURORA_CAPTURE_HIDDEN_WINDOW "##CaptureHidden"
+void aurora_set_capture_overlay(AuroraCaptureOverlay overlay);
+// Video capture: every sealed frame as the window's picture (overlay as set above, NONE counting as STAMP), scaled
+// down to at most maxHeight rows, read back asynchronously and passed to the callback on a render thread with the
+// Unix time (microseconds) it was rendered. Pixels are tightly packed 8-bit, BGRA when bgra is true, else RGBA; the
+// pointer is valid only during the call. Frames are skipped while 4 are still being read back. NULL stops; after
+// that returns, the callback is not called again. Returns false when the swapchain format can't be captured (HDR).
+typedef void (*AuroraVideoFrameCallback)(const uint8_t* pixels, uint32_t width, uint32_t height, bool bgra,
+                                         int64_t unixMicros, void* user);
+bool aurora_set_video_capture(AuroraVideoFrameCallback callback, void* user, uint32_t maxHeight);
 bool aurora_flush_efb_copies_to_ram();
 bool aurora_flush_efb_copy_to_ram(void* dest);
 
@@ -182,6 +230,43 @@ void aurora_set_pause_on_focus_lost(bool value);
 void aurora_set_background_input(bool value);
 void aurora_set_display_mode(AuroraDisplayMode mode);
 AuroraDisplayMode aurora_get_display_mode();
+// Windows only (elsewhere: no monitors, fullscreen stays on the window's monitor). Fills up to maxCount, returns how many.
+uint32_t aurora_get_monitors(AuroraMonitor* monitors, uint32_t maxCount);
+// The monitor fullscreen goes to: an AuroraMonitor id, or "auto" for the one the window is on. A monitor that is gone
+// falls back to the only connected one of the same model, else the main monitor. Applied at once when fullscreen.
+void aurora_set_fullscreen_monitor(const char* id);
+// Motion vectors: where every surface was last frame, per pixel, made while motion blur or the view needs them.
+// Motion blur: how many frames of motion each pixel is smeared over (0.5 = a film camera's 180-degree shutter, up to
+// 4), 0 = off; AuroraConfig::motionBlur at start. The view shows the vectors: 0 = off, 1 = motion
+// only, 2 = over a dimmed picture (grey or the picture = still, hue = direction, saturation = speed, full at `scale`
+// pixels per frame; 0 keeps the scale). Both take effect at the next frame.
+#define AURORA_HAS_MOTION_VECTORS 1
+void aurora_set_motion_blur(float shutter);
+float aurora_get_motion_blur();
+bool aurora_motion_vectors_active();
+void aurora_set_motion_vector_view(int mode, float scale);
+int aurora_get_motion_vector_view();
+float aurora_get_motion_vector_view_scale();
+// The scene stage: the point in each frame where the solid scene is finished, before the see-through world draws and
+// the HUD (effects on the solid scene run there). Its debug view: 0 = off, 1 = tint (everything drawn before the stage
+// is tinted blue), 2 = depth (the solid scene's distance, near = white), 3 = the ambient occlusion alone.
+// Ambient occlusion: how much the solid scene darkens where surfaces crowd each other (creases, corners, under
+// things), 0 = off to 1 = full; AuroraConfig::ambientOcclusion at start. Both take effect at the next frame.
+#define AURORA_HAS_SCENE_STAGE 1
+void aurora_set_scene_stage_view(int mode);
+int aurora_get_scene_stage_view();
+void aurora_set_ambient_occlusion(float strength);
+float aurora_get_ambient_occlusion();
+// Bloom: the game's lights glow softly around themselves, before the HUD. 0 = off to 1 = full; AuroraConfig::bloom at
+// start. Its debug view: 0 off, 1 the glow alone, 2 its source (the light draws alone). Both take effect at the next
+// frame. The lights are the draws that sample one of the game's light textures: the list replaces the last, by texture
+// pack name without ".dds" ("tex1_64x64_0123456789abcdef_14").
+#define AURORA_HAS_BLOOM 1
+void aurora_set_bloom(float strength);
+float aurora_get_bloom();
+void aurora_set_light_textures(const char* const* keys, uint32_t count);
+void aurora_set_bloom_view(int mode);
+int aurora_get_bloom_view();
 
 typedef enum {
   AURORA_METALFX_DISABLED,
@@ -196,8 +281,41 @@ typedef enum {
 void aurora_set_metalfx_spatial(bool enabled);
 bool aurora_get_metalfx_spatial();
 bool aurora_is_metalfx_spatial_supported();
-// Button prompt textures for the controller in use: 0 xbox, 1 playstation, 2 nintendo, -1 the game's own.
-void aurora_set_button_icon_style(int style);
+// Button prompts for the controller in use: family 0 xbox, 1 playstation, 2 nintendo, -1 the game's own GameCube
+// icons. buttons[4]: the pad button (controller_button_names.h config name, e.g. "south") drawn for the GameCube A,
+// B, X and Y buttons; NULL, "" or a button without an icon = that GameCube button's usual one.
+void aurora_set_button_icons(int family, const char* const buttons[4]);
+// The folder of those icons (<UserData>/button_icons/<family>, UTF-8; one <config name>.png per pad button), or "" when
+// no controller is connected (BUTTON_ICONS=<family> pins one, for tests). Writes at most size - 1 bytes and a NUL;
+// returns the full length.
+size_t aurora_get_button_icon_folder(char* out, size_t size);
+// Dev menu (F8): keep a list of every texture drawn since the last reset (off by default).
+void aurora_texture_track_drawn(bool on);
+// Dev menu (F8): one texture of that list. name: its pack file name without the extension; pack: drawn from an HD file
+// (texture pack, mod or the player's texture_replacements); xbox: drawn from the player's Xbox textures;
+// file_width/file_height: the size drawn in its place (0 = the game's own); versions: how often the game rewrote it in
+// place (name = the newest).
+typedef struct AuroraDrawnTexture {
+  char name[96];
+  uint32_t width, height, format, versions, file_width, file_height;
+  bool pack;
+  bool xbox;
+} AuroraDrawnTexture;
+// Copies up to `capacity` entries of the list to `out` and returns how many there are; the generation changes whenever
+// the list does.
+size_t aurora_texture_drawn(AuroraDrawnTexture* out, size_t capacity);
+uint32_t aurora_texture_drawn_generation();
+// Dev menu (F8): forget what has been drawn (the dev menu tracks drawn per level).
+void aurora_texture_replacement_reset_used();
+// Dev menu (F8): draw the texture with this pack file name (no extension) solid magenta, with or without a replacement
+// file; nullptr or "" = off.
+void aurora_texture_replacement_highlight(const char* name);
+// Dev menu (F8): read the texture folders and packs again, as at start, and redraw every texture from them. Does
+// nothing when texture replacement was off at start.
+void aurora_texture_replacement_reload();
+// Dev menu (F8): log every texture's draw states to devmenu_texlog.csv, rows tagged with this scene; nullptr or
+// "" = off.
+void aurora_texture_log(const char* scene);
 AuroraMetalFXStatus aurora_get_metalfx_status();
 
 AuroraBackend aurora_get_backend();

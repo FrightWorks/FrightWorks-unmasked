@@ -11,6 +11,8 @@
 #endif
 #include <windows.h>
 #include <shobjidl.h>
+#elif !defined(__ANDROID__)
+#include <SDL3/SDL_messagebox.h>
 #endif
 
 namespace GameFolder {
@@ -119,9 +121,9 @@ std::string Problem(const fs::path& root) {
 
 bool EnsureConfigured() {
 #if defined(_WIN32)
-    // A "game" folder next to the program needs no questions, and wins over the saved folder: every
-    // install shares Documents\MarioWiiSaveData, so this is how two installs play two games (say the
-    // original and a mod), each with its own saves (nand_path.h keeps saves per game).
+    // A "game" folder next to the program needs no questions, and wins over the saved folder: installs
+    // without the portable marker share one user data folder, so this is how two installs play two games
+    // (say the original and a mod), each with its own saves (nand_path.h keeps saves per game).
     if (const fs::path beside = Find(ProgramDirectory() / "game"); !beside.empty() && Problem(beside).empty()) {
         if (RuntimeConfigFile::DvdRoot().empty()) {
             RuntimeConfigFile::SetDvdRoot(beside);
@@ -159,8 +161,22 @@ bool EnsureConfigured() {
         RT_LOGF(RT_TAG_RUNTIME, "game folder: %s\n", RuntimeConfigFile::PathToUtf8(root).c_str());
         return true;
     }
-#else
+#elif defined(__ANDROID__)
     return true;  // the app chose and checked the folder
+#else
+    // The launcher (or RecompLauncher's setup step) chose and checked the folder; it has gone or changed since. Say so
+    // and quit with kNoGameExitCode, rather than crash at the first disc read. RecompLauncher shows its own message for
+    // that code (recomplauncher.json exit_codes), so no box there.
+    const std::string problem = configured.empty()
+                                    ? std::string("There is no extracted disc in the game folder Config.toml names.")
+                                    : Problem(configured);
+    RT_LOGF(RT_TAG_RUNTIME, "game folder: %s (dvd_root %s)\n", problem.c_str(),
+            RuntimeConfigFile::PathToUtf8(RuntimeConfigFile::ResolvedDvdRoot()).c_str());
+    if (!RuntimeConfigFile::StartedByRecompLauncher()) {
+        const std::string message = problem + "\n\nStart FrightWorks from its launcher and choose your disc there.";
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "FrightWorks: UnMasked", message.c_str(), nullptr);
+    }
+    return false;
 #endif
 }
 

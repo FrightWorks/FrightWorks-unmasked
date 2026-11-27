@@ -1,23 +1,32 @@
 // ROM-free integration probe. Links the actual maintained Aurora renderer.
+#include "gfx/bloom.hpp"
 #include "gfx/common.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/efb_ram_copy.hpp"
+#include "gfx/motion_effects.hpp"
+#include "gfx/scene_stage.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/texture.hpp"
+#include "gfx/texture_replacement.hpp"
 #include "gx/gx.hpp"
 #include "gx/fifo.hpp"
 #include "gx/command_processor.hpp"
 #include "gx/frame_interpolation.hpp"
 #include <dolphin/gx.h>
 #include <aurora/aurora.h>
+#include "webgpu/hdr_presentation.hpp"
 #include <array>
 #include <bit>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -30,10 +39,17 @@ std::array<uint8_t, 16 * 16 * 4 + 32> guardedBake;
 void require(bool value, const char* message) {
   if (!value) throw std::runtime_error(message);
 }
-void submit(bool final, bool download = false, bool async = false) {
+void submit(bool final, bool download = false, bool async = false, bool sealed = false) {
   auto encoder = webgpu::g_device.CreateCommandEncoder();
   if (final) gfx::end_frame(encoder); else gfx::end_batch(encoder);
-  gfx::render(encoder);
+  std::optional<gfx::SealedFrame> frame;
+  if (sealed) {
+    frame.emplace();
+    gfx::seal_frame(*frame);
+    gfx::render(*frame, encoder);
+  } else {
+    gfx::render(encoder);
+  }
   if (download) gfx::efb_ram::encode_downloads(encoder);
   if (async) gfx::efb_ram::encode_async_downloads(encoder);
   auto commands = encoder.Finish();
@@ -169,9 +185,11 @@ Pixels run(unsigned splitEvery, bool async = false, bool offscreen = false, unsi
     GXCopyTex(copyDestination.data(), GX_FALSE);
     texture = gx::g_gxState.copyTextures.at(copyDestination.data()).handle;
   } else {
-  // A partial clear forces the real snapshot and clear-uniform paths after the copy.
-  gfx::resolve_pass(texture, {0, 0, 64, 64}, true, true, true, {0.f, 0.f, 0.f, 1.f},
-                    1.f, GX_TF_RGBA8, nullptr, false, nullptr, false, 1.f, false, false, true);
+    // A partial clear forces the real snapshot and clear-uniform paths after the copy. Like GXCopyTex, an EFB
+    // without alpha (GXInit's RGB8) copies as opaque: GX draws do not write its alpha, so it would otherwise be
+    // whatever an earlier case left in the EFB (it persists between frames).
+    gfx::resolve_pass(texture, {0, 0, 64, 64}, true, true, true, {0.f, 0.f, 0.f, 1.f}, 1.f, GX_TF_RGBA8, nullptr, false,
+                      nullptr, !gx::render_target_has_alpha(gx::g_gxState.pixelFmt), 1.f, false, false, true);
   }
   guarded.fill(0xa5);
   const unsigned extent = async ? 4 : 16;
@@ -209,6 +227,842 @@ Pixels run(unsigned splitEvery, bool async = false, bool offscreen = false, unsi
   Pixels pixels(guarded.begin() + 16, guarded.begin() + 16 + bytes);
   return pixels;
 }
+
+enum class ParticlePath { Bridge, Immediate, ImmediateThenBridge, BridgeThenImmediate };
+
+constexpr std::array particlePaths{
+    ParticlePath::Bridge, ParticlePath::Immediate,
+    ParticlePath::ImmediateThenBridge, ParticlePath::BridgeThenImmediate};
+
+Pixels run_alpha_order(unsigned variant = 0, ParticlePath path = ParticlePath::Bridge) {
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Alpha-order frame begin failed");
+  gfx::push_draw_command(gfx::clear::DrawData{
+      .pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+      .color = {0.f, 0.f, 0.f, 1.f}, .depth = gx::clear_depth_value()});
+  alignas(32) static std::array<uint8_t, 32768> fifo;
+  alignas(32) static std::array<uint8_t, 64> white;
+  white.fill(255);
+  GXInit(fifo.data(), fifo.size());
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetScissor(0, 0, 64, 64);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetColorUpdate(true);
+  GXSetAlphaUpdate(true);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+  GXSetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+  GXSetNumTexGens(1);
+  GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+  GXSetNumChans(1);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  GXTexObj texture{};
+  GXInitTexObj(&texture, white.data(), 4, 4, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, false);
+  GXLoadTexObj(&texture, GX_TEXMAP0);
+  const float projection[]{0.f, 1.f, 0.f, 1.f, 0.f, -0.01f, -0.1f};
+  GXSetProjectionv(projection);
+  const float identity[3][4]{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  GXLoadPosMtxImm(identity, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+  const auto quad = [](float z, std::array<u8, 4> color) {
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy : std::array<std::array<float, 2>, 4>{{{-1, 1}, {1, 1}, {1, -1}, {-1, -1}}}) {
+      GXPosition3f32(xy[0] * -z, xy[1] * -z, z);
+      GXColor4u8(color[0], color[1], color[2], color[3]);
+      GXTexCoord2f32(0.f, 0.f);
+    }
+    GXEnd();
+  };
+  GXSetZMode(true, GX_LEQUAL, true);
+  const bool particleCase = variant >= 11 && variant < 25;
+  quad(particleCase ? -8.f : -4.f, {0, 0, 255, 255});
+  if (particleCase) {
+    std::array<std::array<float, 3>, 4> post{{{-4, 4, -4}, {0, 4, -4}, {0, -4, -4}, {-4, -4, -4}}};
+    GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+    GXSetArray(GX_VA_POS, post.data(), sizeof(post), sizeof(post[0]), true);
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (unsigned index = 0; index < post.size(); ++index) {
+      GXPosition1x8(index); GXColor4u8(255, 0, 0, 255); GXTexCoord2f32(0, 0);
+    }
+    GXEnd();
+    GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GXSetZMode(true, GX_LEQUAL, false);
+    const auto particle = [](std::vector<uint8_t>& raw, float z, std::array<u8, 4> color,
+                             bool nonPlanar = false, bool rotated = false) {
+      unsigned vertex = 0;
+      for (const auto& xy : std::array<std::array<float, 2>, 6>{
+               {{-1, 1}, {1, 1}, {1, -1}, {-1, 1}, {1, -1}, {-1, -1}}}) {
+        const float vz = z + (nonPlanar && vertex == 1 ? .2f : 0.f) + (rotated ? xy[0] * .2f : 0.f);
+        const float size = rotated ? .15f : 1.f;
+        for (const float value : {xy[0] * -z * size, xy[1] * -z * size, vz}) {
+          const auto bits = std::bit_cast<uint32_t>(value);
+          for (int shift : {24, 16, 8, 0}) raw.push_back(bits >> shift);
+        }
+        raw.insert(raw.end(), color.begin(), color.end());
+        for (const float value : {(xy[0] + 1.f) * .5f, (1.f - xy[1]) * .5f}) {
+          const auto bits = std::bit_cast<uint32_t>(value);
+          for (int shift : {24, 16, 8, 0}) raw.push_back(bits >> shift);
+        }
+        ++vertex;
+      }
+    };
+    auto send = [path, draw = 0u](const std::vector<uint8_t>& raw) mutable {
+      const bool immediate = path == ParticlePath::Immediate ||
+                             (path == ParticlePath::ImmediateThenBridge && draw == 0) ||
+                             (path == ParticlePath::BridgeThenImmediate && draw != 0);
+      ++draw;
+      if (!immediate) {
+        require(gx::fifo::submit_raw_draw(GX_TRIANGLES, GX_VTXFMT0, raw.data(), raw.size() / 24, raw.size()),
+                "Particle bridge rejected test data");
+        return;
+      }
+      const auto read = [&](size_t offset) {
+        const uint32_t bits = uint32_t(raw[offset]) << 24 | uint32_t(raw[offset + 1]) << 16 |
+                              uint32_t(raw[offset + 2]) << 8 | uint32_t(raw[offset + 3]);
+        return std::bit_cast<float>(bits);
+      };
+      GXBegin(GX_TRIANGLES, GX_VTXFMT0, raw.size() / 24);
+      for (size_t offset = 0; offset < raw.size(); offset += 24) {
+        GXPosition3f32(read(offset), read(offset + 4), read(offset + 8));
+        GXColor4u8(raw[offset + 12], raw[offset + 13], raw[offset + 14], raw[offset + 15]);
+        GXTexCoord2f32(read(offset + 16), read(offset + 20));
+      }
+      GXEnd();
+    };
+    std::vector<uint8_t> green;
+    const u8 alpha = variant == 22 ? 64 : variant == 23 ? 255 : variant == 24 ? 0 : 128;
+    particle(green, -2, {0, 255, 0, alpha});
+    send(green);
+    if (variant >= 21) {
+      std::vector<uint8_t> leaf;
+      particle(leaf, -3, {111, 83, 49, 180}, false, true);
+      send(leaf);
+    }
+    if (variant == 13) quad(-3, {255, 255, 255, 128});
+    if (variant == 14) GXSetScissor(32, 0, 32, 64);
+    if (variant == 15) {
+      const float changed[]{0.f, 1.01f, 0.f, 1.f, 0.f, -0.01f, -0.1f};
+      GXSetProjectionv(changed);
+    }
+    if (variant == 18) GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, GX_LO_COPY);
+    std::vector<uint8_t> gray;
+    particle(gray, variant == 17 ? -2.f : -6.f, {128, 128, 128, 128}, variant == 16);
+    if (variant != 12) particle(gray, variant == 17 ? -2.f : -1.f, {0, 0, 255, 128});
+    send(gray);
+    if (variant == 19) gfx::flush_deferred_draws();
+  } else {
+  GXSetZMode(true, GX_LEQUAL, false);
+  if (variant == 4) GXSetScissor(0, 0, 32, 64);
+  if (variant == 5) GXSetViewport(0.f, 0.f, 32.f, 64.f, 0.f, 1.f);
+  quad(-2.f, {0, 255, 0, 128});
+  if (variant == 3) quad(-1.f, {0, 0, 255, 128});
+  GXSetScissor(0, 0, 64, 64);
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetZMode(true, GX_LEQUAL, true);
+  if (variant >= 25) {
+    // An invisible blended surface the game draws after its particles, depth write on and no alpha test.
+    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    quad(-1.5f, {255, 0, 0, 0});
+    GXSetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+  }
+  if (variant == 26) {
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(-1.8f, {255, 255, 255, 128});  // behind that surface and after it: its depth still hides this
+    GXSetZMode(true, GX_LEQUAL, true);
+  }
+  if (variant < 25 || variant == 27)
+    quad(variant == 1 ? -1.5f : -3.f, {255, 0, 0, static_cast<u8>(variant == 2 ? 64 : 255)});
+  if (variant == 6 || variant == 7 || variant == 9 || variant == 10) {
+    if (variant == 9) {
+      const float ortho[]{1.f, 1.f, 0.f, 1.f, 0.f, 0.f, -0.5f};
+      GXSetProjectionv(ortho);
+    }
+    GXSetZMode(variant != 7, variant == 9 ? GX_LEQUAL : variant == 10 ? GX_EQUAL : GX_ALWAYS,
+               variant == 6);
+    quad(variant == 10 ? -3.f : -1.f, {255, 255, 255, 255});
+  }
+  }
+  gx::fifo::drain();
+  if (variant == 8) {
+    gfx::push_draw_command(gfx::clear::DrawData{
+        .pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+        .color = {1., 1., 1., 1.}, .depth = 1.f});
+  }
+  auto target = gfx::new_render_texture(64, 64, GX_TF_RGBA8, "Alpha order regression");
+  gfx::resolve_pass(target, {0, 0, 64, 64}, false, false, false,
+                    {0.f, 0.f, 0.f, 1.f}, 1.f, GX_TF_RGBA8, nullptr, false,
+                    nullptr, false, 1.f, false, false, true);
+  guarded.fill(0xa5);
+  gfx::efb_ram::schedule(guarded.data() + 16, 16, 16, GX_TF_RGBA8, target);
+  require(gfx::efb_ram::prepare_downloads(), "Alpha-order readback preparation failed");
+  submit(true, true, false, variant == 20);
+  return Pixels(guarded.begin() + 16, guarded.begin() + 16 + 16 * 16 * 4);
+}
+
+void check_alpha_pixel(const Pixels& pixels, unsigned x, std::array<int, 3> rgb) {
+  const unsigned tile = (2 * 4 + x / 4) * 64;
+  const unsigned pair = (x % 4) * 2;
+  const std::array actual{pixels[tile + pair + 1], pixels[tile + 32 + pair], pixels[tile + 33 + pair]};
+  for (unsigned c = 0; c < 3; ++c) {
+    if (std::abs(static_cast<int>(actual[c]) - rgb[c]) > 2) {
+      std::fprintf(stderr, "alpha-order x=%u expected=%d,%d,%d actual=%u,%u,%u\n",
+                   x, rgb[0], rgb[1], rgb[2], actual[0], actual[1], actual[2]);
+      require(false, "Alpha-order pixel mismatch");
+    }
+  }
+}
+
+// Half-float to float (shared by the HDR present shader test and the motion vector tests).
+float half_to_float(uint16_t h) {
+  const uint32_t sign = (h & 0x8000u) << 16;
+  const uint32_t exponent = (h >> 10) & 0x1fu;
+  const uint32_t mantissa = h & 0x3ffu;
+  if (exponent == 0) {
+    const float value = std::ldexp(static_cast<float>(mantissa), -24);
+    return sign ? -value : value;
+  }
+  return std::bit_cast<float>(sign | ((exponent + 112u) << 23) | (mantissa << 13));
+}
+
+// The HDR present shader (calibration uniform + scRGB picture) on the real device: the exact WGSL the game builds,
+// drawn onto an RGBA16Float target from a flat grey source with both calibration patches on. Checks that it compiles
+// and pipelines without validation errors, that the picture is the linearised, paper-white-scaled, peak-boosted grey,
+// that both checker patches show their nit targets (bright and dim cells), and that pixels outside them are the picture.
+void check_hdr_present_shader() {
+  constexpr uint32_t size = 64;
+  constexpr float paper = 200.f, peak = 1000.f, paperPatchNits = 300.f, peakPatchNits = 1000.f;
+  const auto code = webgpu::copy_shader_source(webgpu::hdr_fragment_tail(), true);
+  wgpu::ShaderSourceWGSL source{};
+  source.code = code.c_str();
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "HDR present test shader"};
+  const auto module = webgpu::g_device.CreateShaderModule(&moduleDescriptor);
+
+  const std::array<wgpu::BindGroupLayoutEntry, 2> pictureEntries{
+      wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+                                 .sampler = {.type = wgpu::SamplerBindingType::Filtering}},
+      wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Fragment,
+                                 .texture = {.sampleType = wgpu::TextureSampleType::Float,
+                                             .viewDimension = wgpu::TextureViewDimension::e2D}}};
+  const wgpu::BindGroupLayoutDescriptor pictureLayoutDescriptor{.entryCount = pictureEntries.size(),
+                                                                .entries = pictureEntries.data()};
+  const auto pictureLayout = webgpu::g_device.CreateBindGroupLayout(&pictureLayoutDescriptor);
+  const wgpu::BindGroupLayoutEntry uniformEntry{
+      .binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+      .buffer = {.type = wgpu::BufferBindingType::Uniform, .minBindingSize = sizeof(webgpu::HdrPresentationUniform)}};
+  const wgpu::BindGroupLayoutDescriptor uniformLayoutDescriptor{.entryCount = 1, .entries = &uniformEntry};
+  const auto uniformLayout = webgpu::g_device.CreateBindGroupLayout(&uniformLayoutDescriptor);
+  const std::array layouts{pictureLayout, uniformLayout};
+  const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{.bindGroupLayoutCount = layouts.size(),
+                                                                .bindGroupLayouts = layouts.data()};
+  const auto pipelineLayout = webgpu::g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  const wgpu::ColorTargetState colorTarget{.format = wgpu::TextureFormat::RGBA16Float,
+                                           .writeMask = wgpu::ColorWriteMask::All};
+  const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 1,
+                                     .targets = &colorTarget};
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .label = "HDR present test pipeline", .layout = pipelineLayout,
+      .vertex = {.module = module, .entryPoint = "vs_main"}, .fragment = &fragment};
+  const auto pipeline = webgpu::g_device.CreateRenderPipeline(&pipelineDescriptor);
+
+  // A 4x4 grey (128/255) source, so every sample, filtered or not, is the same grey.
+  const wgpu::TextureDescriptor sourceDescriptor{
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .size = {4, 4, 1}, .format = wgpu::TextureFormat::RGBA8Unorm};
+  const auto sourceTexture = webgpu::g_device.CreateTexture(&sourceDescriptor);
+  std::vector<uint8_t> grey(256 * 4, 0);
+  for (unsigned row = 0; row < 4; ++row)
+    for (unsigned texel = 0; texel < 4; ++texel)
+      for (unsigned c = 0; c < 4; ++c) grey[row * 256 + texel * 4 + c] = c == 3 ? 255 : 128;
+  const wgpu::TexelCopyTextureInfo sourceCopy{.texture = sourceTexture};
+  const wgpu::TexelCopyBufferLayout sourceLayout{.bytesPerRow = 256, .rowsPerImage = 4};
+  const wgpu::Extent3D sourceExtent{4, 4, 1};
+  webgpu::g_queue.WriteTexture(&sourceCopy, grey.data(), grey.size(), &sourceLayout, &sourceExtent);
+  const wgpu::SamplerDescriptor samplerDescriptor{.magFilter = wgpu::FilterMode::Linear,
+                                                  .minFilter = wgpu::FilterMode::Linear};
+  const auto sampler = webgpu::g_device.CreateSampler(&samplerDescriptor);
+  const std::array<wgpu::BindGroupEntry, 2> pictureBindings{
+      wgpu::BindGroupEntry{.binding = 0, .sampler = sampler},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = sourceTexture.CreateView()}};
+  const wgpu::BindGroupDescriptor pictureGroupDescriptor{.layout = pictureLayout, .entryCount = pictureBindings.size(),
+                                                         .entries = pictureBindings.data()};
+  const auto pictureGroup = webgpu::g_device.CreateBindGroup(&pictureGroupDescriptor);
+
+  // The uniform comes from the production helper; only the two patch rectangles and nit targets are set here.
+  auto uniform = webgpu::hdr_presentation_uniform(paper, peak, size, size);
+  const std::array<float, 4> paperRect{.1f, .1f, .4f, .4f}, peakRect{.6f, .1f, .9f, .4f};
+  uniform.paperRect = paperRect;
+  uniform.peakRect = peakRect;
+  uniform.parameters[0] = paperPatchNits;
+  uniform.parameters[1] = peakPatchNits;
+  const wgpu::BufferDescriptor uniformDescriptor{.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                                                 .size = sizeof(uniform)};
+  const auto uniformBuffer = webgpu::g_device.CreateBuffer(&uniformDescriptor);
+  webgpu::g_queue.WriteBuffer(uniformBuffer, 0, &uniform, sizeof(uniform));
+  const wgpu::BindGroupEntry uniformBinding{.binding = 0, .buffer = uniformBuffer, .size = sizeof(uniform)};
+  const wgpu::BindGroupDescriptor uniformGroupDescriptor{.layout = uniformLayout, .entryCount = 1,
+                                                         .entries = &uniformBinding};
+  const auto uniformGroup = webgpu::g_device.CreateBindGroup(&uniformGroupDescriptor);
+
+  const wgpu::TextureDescriptor targetDescriptor{
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+      .size = {size, size, 1}, .format = wgpu::TextureFormat::RGBA16Float};
+  const auto target = webgpu::g_device.CreateTexture(&targetDescriptor);
+  constexpr uint32_t rowBytes = size * 8;  // already a multiple of 256
+  const wgpu::BufferDescriptor readbackDescriptor{.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+                                                  .size = rowBytes * size};
+  const auto readback = webgpu::g_device.CreateBuffer(&readbackDescriptor);
+  const auto encoder = webgpu::g_device.CreateCommandEncoder();
+  const wgpu::RenderPassColorAttachment attachment{.view = target.CreateView(), .loadOp = wgpu::LoadOp::Clear,
+                                                   .storeOp = wgpu::StoreOp::Store};
+  const wgpu::RenderPassDescriptor passDescriptor{.colorAttachmentCount = 1, .colorAttachments = &attachment};
+  const auto pass = encoder.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, pictureGroup);
+  pass.SetBindGroup(1, uniformGroup);
+  pass.SetViewport(0.f, 0.f, size, size, 0.f, 1.f);
+  pass.Draw(3);
+  pass.End();
+  const wgpu::TexelCopyTextureInfo from{.texture = target};
+  const wgpu::TexelCopyBufferInfo to{.layout = {.bytesPerRow = rowBytes, .rowsPerImage = size}, .buffer = readback};
+  const wgpu::Extent3D extent{size, size, 1};
+  encoder.CopyTextureToBuffer(&from, &to, &extent);
+  const auto commands = encoder.Finish();
+  webgpu::g_queue.Submit(1, &commands);
+  bool mapped = false;
+  const auto mapFuture = readback.MapAsync(wgpu::MapMode::Read, 0, rowBytes * size, wgpu::CallbackMode::WaitAnyOnly,
+                                           [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                                             mapped = status == wgpu::MapAsyncStatus::Success;
+                                           });
+  webgpu::g_instance.WaitAny(mapFuture, 5000000000ull);
+  require(mapped, "HDR shader test readback did not map");
+  const auto* data = static_cast<const uint16_t*>(readback.GetConstMappedRange(0, rowBytes * size));
+  const auto at = [&](unsigned x, unsigned y, unsigned c) { return half_to_float(data[y * size * 4 + x * 4 + c]); };
+  const auto near = [](float got, float want) { return std::fabs(got - want) <= 0.01f * std::max(1.f, std::fabs(want)) + 0.002f; };
+  const auto patch = [&](unsigned x, unsigned y, const std::array<float, 4>& rect, float nits, float dim) {
+    const float u = (x + .5f) / size, v = (y + .5f) / size;
+    const int cx = static_cast<int>(std::floor((u - rect[0]) / (rect[2] - rect[0]) * 8));
+    const int cy = static_cast<int>(std::floor((v - rect[1]) / (rect[3] - rect[1]) * 4));
+    return nits * (((cx + cy) & 1) == 0 ? 1.f : dim) / 80.f;
+  };
+  const float linear = std::pow(128.f / 255.f, 2.2f);
+  const float picture = linear * (1.f + (peak / paper - 1.f) * std::pow(linear, 4.f)) * paper / 80.f;
+  require(near(at(32, 48, 0), picture) && near(at(32, 48, 1), picture) && near(at(32, 48, 2), picture) &&
+          near(at(32, 48, 3), 1.f), "HDR present picture is not the scaled, boosted grey");
+  require(near(at(5, 5, 0), picture) && near(at(62, 62, 0), picture), "HDR present picture changed outside the patches");
+  bool brightSeen = false, dimSeen = false;
+  for (const auto& [rect, nits, dim] : {std::tuple{paperRect, paperPatchNits, 0.6f}, std::tuple{peakRect, peakPatchNits, 0.9f}}) {
+    for (unsigned y = static_cast<unsigned>(rect[1] * size) + 1; y < static_cast<unsigned>(rect[3] * size) - 1; y += 3) {
+      for (unsigned x = static_cast<unsigned>(rect[0] * size) + 1; x < static_cast<unsigned>(rect[2] * size) - 1; x += 3) {
+        const float want = patch(x, y, rect, nits, dim);
+        require(near(at(x, y, 0), want) && near(at(x, y, 1), want) && near(at(x, y, 2), want) && near(at(x, y, 3), 1.f),
+                "HDR calibration patch value differs from its nit target");
+        (want == nits / 80.f ? brightSeen : dimSeen) = true;
+      }
+    }
+  }
+  require(brightSeen && dimSeen, "HDR calibration patches did not show both checker cells");
+  readback.Unmap();
+  std::puts("Actual Aurora HDR present shader: picture, both calibration patches and checker cells match");
+}
+
+// ----- Motion vectors: the same perspective quad on consecutive frames, moved by its position matrix.
+
+// The 4 bytes of a 32-bit target's pixel (x, y), as the screenshot path reads them: copied to a buffer.
+std::array<uint8_t, 4> read_texel(const wgpu::Texture& texture, unsigned x, unsigned y) {
+  require(static_cast<bool>(texture), "No target to read");
+  const wgpu::BufferDescriptor descriptor{.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+                                          .size = 256};
+  const auto buffer = webgpu::g_device.CreateBuffer(&descriptor);
+  auto encoder = webgpu::g_device.CreateCommandEncoder();
+  const wgpu::TexelCopyTextureInfo source{.texture = texture, .origin = {x, y, 0}};
+  const wgpu::TexelCopyBufferInfo destination{.layout = {.bytesPerRow = 256, .rowsPerImage = 1}, .buffer = buffer};
+  const wgpu::Extent3D size{1, 1, 1};
+  encoder.CopyTextureToBuffer(&source, &destination, &size);
+  const auto commands = encoder.Finish();
+  webgpu::g_queue.Submit(1, &commands);
+  std::atomic_bool done{false};
+  bool mapped = false;
+  buffer.MapAsync(wgpu::MapMode::Read, 0, 4, wgpu::CallbackMode::AllowProcessEvents,
+                  [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                    mapped = status == wgpu::MapAsyncStatus::Success;
+                    done = true;
+                  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!done) {
+    webgpu::g_instance.ProcessEvents();
+    require(std::chrono::steady_clock::now() < deadline, "Motion readback did not complete");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  require(mapped, "Motion readback failed");
+  std::array<uint8_t, 4> result;
+  std::memcpy(result.data(), buffer.GetConstMappedRange(0, 4), result.size());
+  buffer.Unmap();
+  return result;
+}
+
+// The EFB motion vector (render pixels, where the surface was last frame minus where it is) at pixel (x, y).
+std::array<float, 2> read_motion(unsigned x, unsigned y) {
+  const auto half = std::bit_cast<std::array<uint16_t, 2>>(read_texel(webgpu::g_motionVectors.texture, x, y));
+  return {half_to_float(half[0]), half_to_float(half[1])};
+}
+
+// One frame: a quad over the middle half of the 64x64 viewport (z = -4), moved `shift` (normalized device
+// coordinates, so 32 pixels per unit; the matrix moves it 4 units per unit) to the right by its position matrix.
+// `blended`: alpha-blended, still writing depth. `twoQuads`: instead two narrower quads, x -0.9 to -0.6 and -0.4 to
+// -0.1 (y -0.25 to 0.25), each its own draw on its own matrix slot, both moved the same: two still draws that agree on
+// the camera's change, so a frame-wide shift reads as the camera's own.
+void draw_motion_frame(float shift, bool blended = false, bool twoQuads = false) {
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Motion frame begin failed");
+  gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+                                              .color = {0.f, 0.f, 0.f, 1.f},
+                                              .depth = gx::clear_depth_value()});
+  alignas(32) static std::array<uint8_t, 32768> fifo;
+  GXInit(fifo.data(), fifo.size());
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetScissor(0, 0, 64, 64);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetColorUpdate(true);
+  GXSetAlphaUpdate(true);
+  if (blended) {
+    GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+  } else {
+    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+  }
+  GXSetZMode(true, GX_LEQUAL, true);
+  GXSetNumTexGens(0);
+  GXSetNumChans(1);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+  GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  const float projection[]{0.f, 1.f, 0.f, 1.f, 0.f, -0.01f, -0.1f}; // perspective: x, y divided by -z
+  GXSetProjectionv(projection);
+  constexpr float z = -4.f;
+  const float position[3][4]{{1.f, 0.f, 0.f, shift * -z}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  GXLoadPosMtxImm(position, GX_PNMTX0);
+  GXLoadPosMtxImm(position, GX_PNMTX1);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  const auto quad = [&](float left, float right, float bottom, float top) {
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy :
+         std::array<std::array<float, 2>, 4>{{{left, top}, {right, top}, {right, bottom}, {left, bottom}}}) {
+      GXPosition3f32(xy[0] * -z, xy[1] * -z, z);
+      GXColor4u8(255, 255, 255, 255);
+    }
+    GXEnd();
+  };
+  if (twoQuads) {
+    quad(-.9f, -.6f, -.25f, .25f);
+    GXSetCurrentMtx(GX_PNMTX1);
+    quad(-.4f, -.1f, -.25f, .25f);
+  } else {
+    quad(-.5f, .5f, -.5f, .5f);
+  }
+  gx::fifo::drain();
+  submit(true, false, false, true);
+}
+
+// Draws until the pipelines for the current motion setting are built, as unready ones are skipped.
+void settle_motion_pipelines(bool blended = false, bool twoQuads = false) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+    require(std::chrono::steady_clock::now() < deadline, "Motion vector pipelines were not built");
+    draw_motion_frame(0.f, blended, twoQuads);
+    webgpu::g_instance.ProcessEvents();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+// One frame repeating the last draw with no GX state written since, so only a motion setting change can end the
+// resolved pipeline: a frame with one material can do this (a movie, say).
+void draw_same_state_frame(bool settingChanged) {
+  const auto generation = gx::g_gxState.pipelineStateGeneration;
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Motion frame begin failed");
+  require((generation != gx::g_gxState.pipelineStateGeneration) == settingChanged,
+          settingChanged ? "Resolved pipeline kept across a motion setting change"
+                         : "Resolved pipeline dropped with no motion setting change");
+  constexpr float z = -4.f;
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  for (const auto& xy : std::array<std::array<float, 2>, 4>{{{-.5f, .5f}, {.5f, .5f}, {.5f, -.5f}, {-.5f, -.5f}}}) {
+    GXPosition3f32(xy[0] * -z, xy[1] * -z, z);
+    GXColor4u8(255, 255, 255, 255);
+  }
+  GXEnd();
+  gx::fifo::drain();
+  submit(true, false, false, true);
+}
+
+// ----- Scene stage: a solid quad (writes depth) on the left half, then a see-through world quad (depth test, no
+// depth write: the cut-out modes' tail) on the right half; the frame ends with nothing after the tail.
+// Crease: instead a floor (y = -0.5, from 1.5 to 3 units away) meeting a wall (3 units away, up to y = 1), with a
+// small see-through quad in the top-left corner so the frame has a tail.
+// Layer: the left quad is drawn a second time, see-through (half green from the material colour, the same vertices,
+// depth test only), like the game's two-layer materials; the right quad as usual.
+// SplitBetween, SplitTail, SplitMidTail: as Basic, submitted in two parts by a full staging buffer: after a flush with
+// solid and see-through draws still to come; with the tail pending and nothing after it; in the middle of the tail.
+// LateLayer: as Layer, then a late blended surface in front of it (alpha 0, writing depth, the place the game draws the
+// faded door and wall pieces in): it must stay after the second layer, or its depth hides the layer.
+// MergedLayers: two solid quads that merge into one draw, each drawn a second time see-through.
+enum class StageScene { Basic, Crease, Layer, SplitBetween, SplitTail, SplitMidTail, LateLayer, MergedLayers, NoCamera };
+void draw_stage_frame(StageScene scene = StageScene::Basic) {
+  const bool crease = scene == StageScene::Crease;
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Scene stage frame begin failed");
+  gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+                                              .color = {0.f, 0.f, 0.f, 1.f},
+                                              .depth = gx::clear_depth_value()});
+  alignas(32) static std::array<uint8_t, 32768> fifo;
+  GXInit(fifo.data(), fifo.size());
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetScissor(0, 0, 64, 64);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetColorUpdate(true);
+  GXSetAlphaUpdate(true);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+  GXSetNumTexGens(0);
+  GXSetNumChans(1);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+  GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  const float projection[]{0.f, 1.f, 0.f, 1.f, 0.f, -0.01f, -0.1f};
+  GXSetProjectionv(projection);
+  const float identity[3][4]{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  GXLoadPosMtxImm(identity, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  constexpr float z = -4.f;
+  const auto quad = [&](float left, float right, std::array<u8, 4> color, float quadZ = z) {
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy :
+         std::array<std::array<float, 2>, 4>{{{left, .5f}, {right, .5f}, {right, -.5f}, {left, -.5f}}}) {
+      GXPosition3f32(xy[0] * -quadZ, xy[1] * -quadZ, quadZ);
+      GXColor4u8(color[0], color[1], color[2], color[3]);
+    }
+    GXEnd();
+  };
+  GXSetZMode(true, GX_LEQUAL, true);
+  if (scene == StageScene::NoCamera) {
+    // A 2D quad that writes depth, then something see-through in perspective: the stage runs, and no perspective draw
+    // has written depth for it to take a camera from.
+    const float ortho[]{1.f, 1.f, 0.f, 1.f, 0.f, -.5f, -.5f};
+    GXSetProjectionv(ortho);
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy : std::array<std::array<float, 2>, 4>{{{-.5f, .5f}, {.5f, .5f}, {.5f, -.5f}, {-.5f, -.5f}}}) {
+      GXPosition3f32(xy[0], xy[1], -.5f);
+      GXColor4u8(255, 255, 255, 255);
+    }
+    GXEnd();
+    GXSetProjectionv(projection);
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(.5f, .9f, {0, 255, 0, 128});
+  } else if (crease) {
+    const auto face = [](std::array<std::array<float, 3>, 4> corners) {
+      GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+      for (const auto& c : corners) {
+        GXPosition3f32(c[0], c[1], c[2]);
+        GXColor4u8(200, 200, 200, 255);
+      }
+      GXEnd();
+    };
+    face({{{-3.f, -.5f, -1.5f}, {3.f, -.5f, -1.5f}, {3.f, -.5f, -3.f}, {-3.f, -.5f, -3.f}}}); // floor
+    face({{{-3.f, 1.f, -3.f}, {3.f, 1.f, -3.f}, {3.f, -.5f, -3.f}, {-3.f, -.5f, -3.f}}});     // wall
+    GXSetZMode(true, GX_LEQUAL, false);
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy :
+         std::array<std::array<float, 2>, 4>{{{-.95f, .95f}, {-.9f, .95f}, {-.9f, .9f}, {-.95f, .9f}}}) {
+      GXPosition3f32(xy[0] * -z, xy[1] * -z, z);
+      GXColor4u8(0, 255, 0, 128);
+    }
+    GXEnd();
+  } else if (scene == StageScene::MergedLayers) {
+    quad(-.9f, -.5f, {255, 0, 0, 255});
+    quad(-.5f, -.1f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+    GXSetChanMatColor(GX_COLOR0A0, GXColor{0, 255, 0, 128});
+    quad(-.9f, -.5f, {255, 0, 0, 255});
+    quad(-.5f, -.1f, {255, 0, 0, 255});
+    GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+    quad(.1f, .9f, {0, 255, 0, 128});
+  } else if (scene == StageScene::SplitBetween) {
+    quad(-.9f, -.1f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(.1f, .3f, {0, 255, 0, 128});
+    gx::fifo::drain();
+    gfx::flush_deferred_draws();
+    gfx::split_staging_batch();
+    GXSetZMode(true, GX_LEQUAL, true);
+    quad(.4f, .6f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(.7f, .9f, {0, 255, 0, 128});
+  } else if (scene == StageScene::SplitTail) {
+    quad(-.9f, -.1f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(.1f, .9f, {0, 255, 0, 128});
+    gx::fifo::drain();
+    gfx::split_staging_batch();
+  } else if (scene == StageScene::SplitMidTail) {
+    quad(-.9f, -.1f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    quad(.1f, .4f, {0, 255, 0, 128});
+    gx::fifo::drain();
+    gfx::split_staging_batch();
+    quad(.5f, .9f, {0, 255, 0, 128});
+  } else {
+    quad(-.9f, -.1f, {255, 0, 0, 255});
+    GXSetZMode(true, GX_LEQUAL, false);
+    if (scene == StageScene::Layer || scene == StageScene::LateLayer) {
+      GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+      GXSetChanMatColor(GX_COLOR0A0, GXColor{0, 255, 0, 128});
+      quad(-.9f, -.1f, {255, 0, 0, 255});
+      GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+    }
+    if (scene == StageScene::LateLayer) {
+      GXSetZMode(true, GX_LEQUAL, true);
+      quad(-.9f, -.1f, {0, 0, 0, 0}, -2.f);
+      GXSetZMode(true, GX_LEQUAL, false);
+    }
+    quad(.1f, .9f, {0, 255, 0, 128});
+  }
+  gx::fifo::drain();
+  submit(true, false, false, true);
+}
+
+// The EFB colour at (x, y) as R, G, B.
+std::array<int, 3> read_efb(unsigned x, unsigned y) {
+  const auto bytes = read_texel(webgpu::g_frameBuffer.texture, x, y);
+  if (webgpu::g_frameBuffer.format == wgpu::TextureFormat::BGRA8Unorm)
+    return {bytes[2], bytes[1], bytes[0]};
+  return {bytes[0], bytes[1], bytes[2]};
+}
+
+void check_efb(unsigned x, unsigned y, std::array<int, 3> expected, const char* what) {
+  const auto actual = read_efb(x, y);
+  for (int c = 0; c < 3; ++c) {
+    if (std::abs(actual[c] - expected[c]) > 3) {
+      std::fprintf(stderr, "scene stage %s at %u,%u expected=%d,%d,%d actual=%d,%d,%d\n", what, x, y, expected[0],
+                   expected[1], expected[2], actual[0], actual[1], actual[2]);
+      require(false, "Scene stage pixel mismatch");
+    }
+  }
+}
+
+// What the bloom's scene adds: nothing, an opaque black see-through quad in front of the left quad's outer edge
+// (columns 0 to 6, drawn in the see-through tail), or the right quad drawn see-through (in the tail) instead of solid.
+enum class BloomExtra { None, Cover, TailRight };
+
+// The bloom's scene: two equally bright white quads over black, 4 units away, the left one (columns 8 to 23) textured
+// with `lightTexture`, the right one (40 to 55) with `plainTexture`, then a faint see-through quad in a corner (so the
+// frame has a see-through tail, and a scene stage), and `extra`.
+void draw_bloom_frame(GXTexObj& lightTexture, GXTexObj& plainTexture, BloomExtra extra = BloomExtra::None) {
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Bloom frame begin failed");
+  gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+                                              .color = {0.f, 0.f, 0.f, 1.f},
+                                              .depth = gx::clear_depth_value()});
+  alignas(32) static std::array<uint8_t, 32768> fifo;
+  GXInit(fifo.data(), fifo.size());
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetScissor(0, 0, 64, 64);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetColorUpdate(true);
+  GXSetAlphaUpdate(true);
+  GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+  GXSetNumTexGens(1);
+  GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+  GXSetNumChans(1);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  const float projection[]{0.f, 1.f, 0.f, 1.f, 0.f, -0.01f, -0.1f};
+  GXSetProjectionv(projection);
+  const float identity[3][4]{{1.f, 0.f, 0.f, 0.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  GXLoadPosMtxImm(identity, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+  constexpr float z = -4.f;
+  const auto quad = [&](float left, float right, float top, float bottom, std::array<u8, 4> color) {
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    for (const auto& xy :
+         std::array<std::array<float, 2>, 4>{{{left, top}, {right, top}, {right, bottom}, {left, bottom}}}) {
+      GXPosition3f32(xy[0] * -z, xy[1] * -z, z);
+      GXColor4u8(color[0], color[1], color[2], color[3]);
+      GXTexCoord2f32(0.f, 0.f);
+    }
+    GXEnd();
+  };
+  GXSetZMode(true, GX_LEQUAL, true);
+  GXLoadTexObj(&lightTexture, GX_TEXMAP0);
+  quad(-.75f, -.25f, .25f, -.25f, {255, 255, 255, 255});
+  GXLoadTexObj(&plainTexture, GX_TEXMAP0);
+  GXSetZMode(true, GX_LEQUAL, extra != BloomExtra::TailRight);
+  quad(.25f, .75f, .25f, -.25f, {255, 255, 255, 255});
+  GXSetZMode(true, GX_LEQUAL, false);
+  quad(.9f, .95f, .95f, .9f, {0, 255, 0, 16});
+  if (extra == BloomExtra::Cover)
+    quad(-1.f, -.8f, .5f, -.5f, {0, 0, 0, 255});
+  gx::fifo::drain();
+  submit(true, false, false, true);
+}
+
+// Draws the scene until its pipelines are built (unready ones are skipped), then once more to read.
+void settle_stage_frame(StageScene scene) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+    require(std::chrono::steady_clock::now() < deadline, "Scene stage pipelines were not built");
+    draw_stage_frame(scene);
+    webgpu::g_instance.ProcessEvents();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  draw_stage_frame(scene);
+}
+
+// The GX state both animated-mesh tests draw with: indexed positions, opaque, on a black 64x64 frame.
+void begin_animated_frame() {
+  gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
+  require(gfx::begin_frame(), "Animated frame begin failed");
+  gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
+                                              .color = {0.f, 0.f, 0.f, 1.f},
+                                              .depth = gx::clear_depth_value()});
+  alignas(32) static std::array<uint8_t, 32768> fifo;
+  GXInit(fifo.data(), fifo.size());
+  gx::g_gxState.viewportPolicy = AURORA_VIEWPORT_NATIVE;
+  GXSetViewport(0.f, 0.f, 64.f, 64.f, 0.f, 1.f);
+  GXSetScissor(0, 0, 64, 64);
+  GXSetCullMode(GX_CULL_NONE);
+  GXSetColorUpdate(true);
+  GXSetAlphaUpdate(true);
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+  GXSetZMode(true, GX_LEQUAL, true);
+  GXSetNumTexGens(0);
+  GXSetNumChans(1);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+  GXSetChanCtrl(GX_COLOR0A0, false, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+  const float projection[]{0.f, 1.f, 0.f, 1.f, 0.f, -0.01f, -0.1f};
+  GXSetProjectionv(projection);
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+}
+
+void draw_indexed_quad() {
+  GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+  for (u8 index = 0; index < 4; ++index) {
+    GXPosition1x8(index);
+    GXColor4u8(255, 255, 255, 255);
+  }
+  GXEnd();
+}
+
+// Two copies of a mesh the game animates on the CPU (like the f001 fish paste), one step out of phase: each frame both
+// rewrite their positions (indexed, from their own arrays), copy 1 at x = -2 with its quad raised `step` x 0.5 units,
+// copy 2 at x = +2 a step further. In the next frame copy 1 has the shape copy 2 had: same positions, same identity.
+// `secondOnly`: copy 1 isn't drawn, as when the game stops drawing one of a mesh's copies.
+void draw_animated_copies(int step, bool secondOnly = false) {
+  begin_animated_frame();
+  // Each copy's own array, rewritten every frame (aligned like the game's).
+  alignas(32) static std::array<std::array<float, 3>, 4> arrays[2];
+  constexpr float z = -4.f;
+  for (int copy = secondOnly ? 1 : 0; copy < 2; ++copy) {
+    const float raise = static_cast<float>(step + copy) * .5f;
+    arrays[copy] = {{{-.8f, raise + .8f, z}, {.8f, raise + .8f, z}, {.8f, raise - .8f, z}, {-.8f, raise - .8f, z}}};
+    const float position[3][4]{{1.f, 0.f, 0.f, copy == 0 ? -2.f : 2.f}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+    GXLoadPosMtxImm(position, GX_PNMTX0);
+    GXSetCurrentMtx(GX_PNMTX0);
+    GXSetArray(GX_VA_POS, arrays[copy].data(), sizeof(arrays[copy]), sizeof(arrays[copy][0]), true);
+    draw_indexed_quad();
+  }
+  gx::fifo::drain();
+  submit(true, false, false, true);
+}
+
+// One mesh animated on the CPU (the i004 ghosts) that also moves by its matrix, `step` x 1 unit to the right (8 pixels)
+// with its quad raised `step` x 0.5 units (4 pixels). Returns the motion at (x, y) in each image of the frame, the
+// in-between images first, as the frame's presentation replays them.
+std::vector<std::array<float, 2>> draw_animated_mover(int step, unsigned x, unsigned y) {
+  begin_animated_frame();
+  alignas(32) static std::array<std::array<float, 3>, 4> array;
+  constexpr float z = -4.f;
+  const float raise = static_cast<float>(step) * .5f;
+  array = {{{-1.6f, raise + 1.6f, z}, {1.6f, raise + 1.6f, z}, {1.6f, raise - 1.6f, z}, {-1.6f, raise - 1.6f, z}}};
+  const float position[3][4]{{1.f, 0.f, 0.f, static_cast<float>(step)}, {0.f, 1.f, 0.f, 0.f}, {0.f, 0.f, 1.f, 0.f}};
+  GXLoadPosMtxImm(position, GX_PNMTX0);
+  GXSetCurrentMtx(GX_PNMTX0);
+  GXSetArray(GX_VA_POS, array.data(), sizeof(array), sizeof(array[0]), true);
+  draw_indexed_quad();
+  gx::fifo::drain();
+
+  auto encoder = webgpu::g_device.CreateCommandEncoder();
+  gfx::end_frame(encoder);
+  gfx::SealedFrame frame;
+  gfx::seal_frame(frame);
+  std::vector<std::array<float, 2>> motion;
+  const auto image = [&](int32_t interpolatedFrame, bool finalize) {
+    gfx::render(frame, encoder, interpolatedFrame, finalize);
+    const auto commands = encoder.Finish();
+    webgpu::g_queue.Submit(1, &commands);
+    motion.push_back(read_motion(x, y));
+    encoder = webgpu::g_device.CreateCommandEncoder();
+  };
+  if (gx::frame_interpolation_replay_safe()) {
+    AuroraFrameInterpolationDiagnostics interpolation{};
+    gx::get_frame_interpolation_diagnostics(interpolation);
+    for (uint32_t sample = 0; sample < interpolation.activeSamples; ++sample) {
+      image(static_cast<int32_t>(sample), false);
+    }
+  }
+  image(-1, true);
+  gfx::after_submit();
+  return motion;
+}
+
+void check_motion_value(std::array<float, 2> actual, std::array<float, 2> expected, const char* what) {
+  if (std::fabs(actual[0] - expected[0]) > 0.25f || std::fabs(actual[1] - expected[1]) > 0.25f) {
+    std::fprintf(stderr, "motion %s expected=%g,%g actual=%g,%g\n", what, expected[0], expected[1], actual[0],
+                 actual[1]);
+    require(false, "Motion vector mismatch");
+  }
+}
+
+void check_motion(unsigned x, unsigned y, std::array<float, 2> expected, const char* what) {
+  check_motion_value(read_motion(x, y), expected, what);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -244,6 +1098,382 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     std::printf("Actual Aurora completed seeded startup queue (%u observed pending)\n", prewarmQueued);
+    // Motion vectors: on only while requested; a still quad has none; one moved 0.25 (8 pixels) to the right by its
+    // matrix was 8 pixels to the left last frame, both where it covers and nowhere else.
+    require(!webgpu::g_motionVectors.texture, "Motion vector targets exist while not requested");
+    gfx::request_motion_vectors(true);
+    // Its pipelines (with the motion targets) are new: draw until they are built, as unready ones are skipped.
+    const auto motionDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+      require(std::chrono::steady_clock::now() < motionDeadline, "Motion vector pipelines were not built");
+      draw_motion_frame(0.f);
+      webgpu::g_instance.ProcessEvents();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    draw_motion_frame(0.f);
+    check_motion(32, 32, {0.f, 0.f}, "still");
+    draw_motion_frame(.25f);
+    check_motion(36, 32, {-8.f, 0.f}, "moved");
+    check_motion(4, 32, {0.f, 0.f}, "background");
+    // Copies of a CPU-animated mesh, out of phase: copy 1 now has the shape copy 2 had last frame. It pairs with its
+    // own draw, not copy 2's (which would read a 32-pixel jump), and gets its vertices' own motion: up 0.5 units, 4
+    // pixels.
+    for (int step = 0; step < 4; ++step)
+      draw_animated_copies(step); // pipelines built, history recorded
+    {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      while (gfx::queued_pipeline_count() != 0) {
+        require(std::chrono::steady_clock::now() < deadline, "Animated copies pipelines were not built");
+        webgpu::g_instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    draw_animated_copies(4);
+    draw_animated_copies(5);
+    // Copy 1 at x = -2 (NDC -0.5: column 16), raised 2.5 units (NDC 0.625: row 12).
+    check_motion(16, 12, {0.f, 4.f}, "animated copy");
+    std::printf("Actual Aurora motion vectors: a CPU-animated copy out of phase with another keeps its own motion\n");
+    // The game stops drawing copy 1 (the i004 ghosts, as one leaves the view). Copy 2 is now the mesh's first draw, but
+    // its previous shape is still its own: 4 pixels, not the 8 it would read from copy 1's. At x = +2 (column 48), raised
+    // 3.5 units (NDC 0.875: row 4).
+    draw_animated_copies(6, true);
+    check_motion(48, 4, {0.f, 4.f}, "animated copy, the other copy gone");
+    std::printf("Actual Aurora motion vectors: a CPU-animated copy keeps its own previous shape when another stops drawing\n");
+    // In-between images: the blur scales each one's motion up by the inverse of how far along it is, so all of a draw's
+    // motion has to cover that share of the frame, the vertices' too, or they blur 3x, then 1.5x, then 1x, every frame.
+    // 8 pixels by the matrix and 4 by the vertices a frame; pixel (36, 30) stays on the quad in all three images.
+    aurora_set_frame_interpolation_fps(180);
+    {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      for (int step = -3; step < 0 || gfx::queued_pipeline_count() != 0; ++step) {
+        require(std::chrono::steady_clock::now() < deadline, "Animated mover pipelines were not built");
+        draw_animated_mover(std::min(step, -1), 36, 30);
+        webgpu::g_instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    draw_animated_mover(-1, 36, 30);
+    draw_animated_mover(0, 36, 30);
+    {
+      const auto images = draw_animated_mover(1, 36, 30);
+      for (const auto& m : images) {
+        std::printf("Animated mover image motion %g,%g\n", m[0], m[1]);
+      }
+      require(images.size() == 3, "Animated mover did not replay two in-between images");
+      check_motion_value(images[0], {-8.f / 3.f, 4.f / 3.f}, "animated mover, first in-between image");
+      check_motion_value(images[1], {-16.f / 3.f, 8.f / 3.f}, "animated mover, second in-between image");
+      check_motion_value(images[2], {-8.f, 4.f}, "animated mover, the frame's own image");
+    }
+    aurora_set_frame_interpolation_fps(0);
+    std::printf("Actual Aurora motion vectors: an in-between image's vertex motion covers its share of the frame\n");
+    // A camera cut: when the whole picture moves more than a camera can in one frame (here 2.4 units, over the
+    // 2-unit limit), the frame has no motion; 1 unit is still motion.
+    settle_motion_pipelines(false, true);
+    draw_motion_frame(.25f, false, true);
+    check_motion(16, 32, {-8.f, 0.f}, "camera move, first quad");
+    check_motion(32, 32, {-8.f, 0.f}, "camera move, second quad");
+    draw_motion_frame(0.f, false, true);
+    draw_motion_frame(0.f, false, true);
+    draw_motion_frame(.6f, false, true);
+    check_motion(27, 32, {0.f, 0.f}, "camera cut, first quad");
+    check_motion(43, 32, {0.f, 0.f}, "camera cut, second quad");
+    std::printf("Actual Aurora camera cut: no motion past the cut limit, -8 px below it\n");
+    gfx::request_motion_vectors(false);
+    draw_motion_frame(0.f);
+    require(!webgpu::g_motionVectors.texture, "Motion vector targets kept after the request ended");
+    std::printf("Actual Aurora motion vectors: still 0, moved -8 px, off frees the targets\n");
+    // The motion setting changes the pass's attachments: a pipeline resolved before the change must not be reused,
+    // and nothing is resolved again while it stays the same.
+    settle_motion_pipelines();
+    draw_same_state_frame(false);
+    gfx::request_motion_vectors(true);
+    draw_same_state_frame(true);
+    settle_motion_pipelines();
+    draw_same_state_frame(false);
+    gfx::request_motion_vectors(false);
+    draw_same_state_frame(true);
+    std::printf("Actual Aurora motion setting change resolves the pipeline again\n");
+    // The scene stage runs after the solid scene and before the see-through tail: tinted, the solid quad is
+    // multiplied by (0.35, 0.55, 1) and the see-through one drawn after keeps its colour (half green over black: 128;
+    // tinted it would be 70). The depth view shows the solid quad 4 units away as exp(-4 / 8) grey. Off (before and
+    // after), nothing changes.
+    for (const int mode : {0, 1, 2, 0}) {
+      gfx::scene_stage::set_view(mode);
+      // Draws until the pipelines are built (unready ones are skipped), then once more to read.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+        require(std::chrono::steady_clock::now() < deadline, "Scene stage pipelines were not built");
+        draw_stage_frame();
+        webgpu::g_instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      draw_stage_frame();
+      const int grey = static_cast<int>(std::lround(255.0 * std::exp(-0.5)));
+      check_efb(16, 32,
+                mode == 1   ? std::array{89, 0, 0}
+                : mode == 2 ? std::array{grey, grey, grey}
+                            : std::array{255, 0, 0},
+                mode == 1   ? "tinted solid"
+                : mode == 2 ? "solid depth"
+                            : "solid, view off");
+      // Behind the see-through quad nothing solid is drawn: the depth view shows the clear's depth there, as at the
+      // corner, and the half-green quad drawn after the stage goes over it.
+      const auto under = mode == 2 ? read_efb(4, 4) : std::array{0, 0, 0};
+      check_efb(48, 32, {under[0] / 2, 128 + under[1] / 2, under[2] / 2}, "see-through after the stage");
+    }
+    std::printf(
+        "Actual Aurora scene stage: solid scene tinted, see-through tail after it, depth view, off untouched\n");
+    // Ambient occlusion, seen alone (view 3, full strength): a wall standing on a floor darkens just above their crease
+    // (the wall is 3 units away, so its foot is at row 37 of 64), and neither the wall high up nor the open floor near
+    // the camera shades itself. Applied at full strength the crease darkens the picture too; at 0 nothing changes.
+    {
+      const auto settle = [] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+          require(std::chrono::steady_clock::now() < deadline, "Ambient occlusion pipelines were not built");
+          draw_stage_frame(StageScene::Crease);
+          webgpu::g_instance.ProcessEvents();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        draw_stage_frame(StageScene::Crease);
+      };
+      gfx::scene_stage::set_view(3);
+      settle();
+      const int crease = read_efb(32, 35)[0];
+      const int wallHigh = read_efb(32, 24)[0];
+      const int openFloor = read_efb(32, 44)[0];
+      std::printf("Actual Aurora ambient occlusion (0-255, 255 = none): crease %d, wall high %d, open floor %d\n",
+                  crease, wallHigh, openFloor);
+      require(crease < 215, "Ambient occlusion: the crease is not darkened");
+      require(wallHigh > 248 && openFloor > 248, "Ambient occlusion: a flat surface shades itself");
+      gfx::scene_stage::set_view(0);
+      gfx::scene_stage::set_ambient_occlusion(1.f);
+      settle();
+      const int litCrease = read_efb(32, 35)[0];
+      const int litWall = read_efb(32, 24)[0];
+      require(gfx::scene_stage::holds_targets(), "Ambient occlusion has no targets while on");
+      gfx::scene_stage::set_ambient_occlusion(0.f);
+      settle();
+      require(!gfx::scene_stage::holds_targets(), "Ambient occlusion targets kept after it was turned off");
+      const int plainCrease = read_efb(32, 35)[0];
+      require(litCrease < plainCrease - 10 && std::abs(litWall - read_efb(32, 24)[0]) <= 2,
+              "Ambient occlusion: applying it does not darken only the crease");
+    }
+    // A see-through second layer of a solid surface is part of the solid scene: drawn before the stage, it is tinted
+    // with its surface (half green over red: R 128 x 0.35, G 128 x 0.55 = 70; after the stage G would stay 128).
+    {
+      gfx::scene_stage::set_view(1);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+        require(std::chrono::steady_clock::now() < deadline, "Surface layer pipelines were not built");
+        draw_stage_frame(StageScene::Layer);
+        webgpu::g_instance.ProcessEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      draw_stage_frame(StageScene::Layer);
+      check_efb(16, 32, {45, 70, 0}, "second layer of a solid surface");
+      check_efb(48, 32, {0, 128, 0}, "see-through after the stage, with a layer");
+      gfx::scene_stage::set_view(0);
+      std::printf("Actual Aurora scene stage: a solid surface's see-through second layer is drawn before the stage\n");
+    }
+    // A frame submitted in parts has no stage: nothing is tinted, so nothing is tinted twice (31 instead of 89) and no
+    // see-through draw is tinted (70 instead of 128). The next whole frame has the stage again.
+    {
+      gfx::scene_stage::set_view(1);
+      settle_stage_frame(StageScene::SplitBetween);
+      check_efb(16, 32, {255, 0, 0}, "split between flushes, first solid");
+      check_efb(38, 32, {0, 128, 0}, "split between flushes, first see-through");
+      check_efb(48, 32, {255, 0, 0}, "split between flushes, later solid");
+      check_efb(57, 32, {0, 128, 0}, "split between flushes, later see-through");
+      settle_stage_frame(StageScene::SplitTail);
+      check_efb(16, 32, {255, 0, 0}, "split with the tail pending, solid");
+      check_efb(48, 32, {0, 128, 0}, "split with the tail pending, see-through");
+      settle_stage_frame(StageScene::SplitMidTail);
+      check_efb(16, 32, {255, 0, 0}, "split in the tail, solid");
+      check_efb(40, 32, {0, 128, 0}, "split in the tail, first part");
+      check_efb(56, 32, {0, 128, 0}, "split in the tail, second part");
+      settle_stage_frame(StageScene::Basic);
+      check_efb(16, 32, {89, 0, 0}, "whole frame after a split, solid");
+      check_efb(48, 32, {0, 128, 0}, "whole frame after a split, see-through");
+      gfx::scene_stage::set_view(0);
+      std::printf("Actual Aurora scene stage: a frame submitted in parts has no stage, the next whole frame has it\n");
+    }
+    // A late blended surface in front of a second layer: the same picture with the stage in use as without, but for the
+    // tint on what is before the stage. Drawn too early, its depth hides the layer behind it (89, 0, 0).
+    {
+      settle_stage_frame(StageScene::LateLayer);
+      check_efb(16, 32, {127, 128, 0}, "second layer under a late surface, stage off");
+      gfx::scene_stage::set_view(1);
+      settle_stage_frame(StageScene::LateLayer);
+      check_efb(16, 32, {45, 70, 0}, "second layer under a late surface");
+      check_efb(48, 32, {0, 128, 0}, "see-through after the stage, with a late surface");
+      // Second layers of solid draws that merged: each is recognised (G would stay 128 for the merged one).
+      settle_stage_frame(StageScene::MergedLayers);
+      require(gfx::g_stats.mergedDrawCallCount > 0, "The solid quads did not merge");
+      check_efb(10, 32, {45, 70, 0}, "second layer of the first merged quad");
+      check_efb(22, 32, {45, 70, 0}, "second layer of the next merged quad");
+      check_efb(48, 32, {0, 128, 0}, "see-through after the stage, with merged layers");
+      gfx::scene_stage::set_view(0);
+      std::printf("Actual Aurora scene stage: second layers stay before a late surface, merged solids keep theirs\n");
+    }
+    // With no camera that can be inverted, the stage leaves the picture alone: the 2D quad keeps its colour, with the
+    // ambient occlusion on and in the depth view.
+    {
+      const auto settle = [](StageScene scene = StageScene::Basic) {
+        const auto frame_of = [scene] {
+          if (scene == StageScene::NoCamera) {
+            gfx::scene_stage::note_camera(Mat4x4<float>{}, webgpu::Viewport{0.f, 0.f, 64.f, 64.f, 0.f, 1.f});
+          }
+          draw_stage_frame(scene);
+        };
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+          require(std::chrono::steady_clock::now() < deadline, "Scene stage pipelines were not built");
+          frame_of();
+          webgpu::g_instance.ProcessEvents();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        frame_of();
+      };
+      gfx::scene_stage::set_ambient_occlusion(1.f);
+      settle();
+      settle(StageScene::NoCamera);
+      check_efb(24, 32, {255, 255, 255}, "no camera, no shade");
+      gfx::scene_stage::set_ambient_occlusion(0.f);
+      gfx::scene_stage::set_view(2);
+      settle();
+      settle(StageScene::NoCamera);
+      check_efb(24, 32, {255, 255, 255}, "no camera, no depth view");
+      gfx::scene_stage::set_view(0);
+      std::printf("Actual Aurora scene stage: no camera, no stage\n");
+    }
+    // Bloom: of two equally bright white quads, the one whose texture is on the light list glows past its outer edge
+    // (column 5, three left of the left quad; column 58, three right of the right quad) and the other does not, either
+    // way round, also when it is drawn see-through; a see-through surface drawn in front covers the glow; the source
+    // view shows the light quad alone; off, nothing changes and the targets are freed.
+    {
+      alignas(32) static std::array<uint8_t, 64> leftTexels;
+      alignas(32) static std::array<uint8_t, 64> rightTexels;
+      leftTexels.fill(255);
+      rightTexels.fill(255);
+      rightTexels[0] = 254; // another texture, as white
+      GXTexObj leftTexture{};
+      GXTexObj rightTexture{};
+      GXInitTexObj(&leftTexture, leftTexels.data(), 4, 4, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, false);
+      GXInitTexObj(&rightTexture, rightTexels.data(), 4, 4, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, false);
+      const auto key = [](const GXTexObj& texture) {
+        const auto name =
+            gfx::texture_replacement::build_texture_replacement_name(*reinterpret_cast<const GXTexObj_*>(&texture));
+        return name.substr(0, name.rfind('.'));
+      };
+      const auto settle = [&](BloomExtra extra = BloomExtra::None) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
+          require(std::chrono::steady_clock::now() < deadline, "Bloom pipelines were not built");
+          draw_bloom_frame(leftTexture, rightTexture, extra);
+          webgpu::g_instance.ProcessEvents();
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        draw_bloom_frame(leftTexture, rightTexture, extra);
+      };
+      settle();
+      const auto plainLeft = read_efb(5, 32);
+      const auto plainRight = read_efb(58, 32);
+      check_efb(16, 32, {255, 255, 255}, "bloom off, left quad");
+      gfx::bloom::set_strength(1.f);
+      gfx::bloom::set_light_textures({key(leftTexture)});
+      settle();
+      const int leftGlows = read_efb(5, 32)[0];
+      const int rightStill = read_efb(58, 32)[0];
+      const int uncovered = read_efb(3, 32)[0];
+      require(gfx::bloom::holds_targets(), "Bloom has no targets while on");
+      // A see-through surface in front covers the glow as it covers the light (the glow goes under the tail).
+      settle(BloomExtra::Cover);
+      const int covered = read_efb(3, 32)[0];
+      gfx::bloom::set_light_textures({key(rightTexture)});
+      settle();
+      const int leftStill = read_efb(5, 32)[0];
+      const int rightGlows = read_efb(58, 32)[0];
+      // A light drawn in the see-through tail glows too.
+      settle(BloomExtra::TailRight);
+      const int tailGlows = read_efb(58, 32)[0];
+      std::printf(
+          "Actual Aurora bloom (0-255, outer edges, plain %d %d): left listed %d %d, right listed %d %d, right "
+          "see-through %d; beside the left quad %d, covered %d\n",
+          plainLeft[0], plainRight[0], leftGlows, rightStill, leftStill, rightGlows, tailGlows, uncovered, covered);
+      require(leftGlows > rightStill + 10 && rightGlows > leftStill + 10, "Bloom: the glow does not follow the list");
+      require(leftGlows > plainLeft[0] + 10, "Bloom: the light texture does not glow");
+      require(uncovered > 10 && covered <= 3, "Bloom: a see-through surface in front does not cover the glow");
+      require(tailGlows > leftStill + 10, "Bloom: a see-through light does not glow");
+      gfx::bloom::set_strength(0.f);
+      gfx::bloom::set_view(2);
+      settle();
+      check_efb(48, 32, {255, 255, 255}, "bloom source view, listed quad");
+      check_efb(16, 32, {0, 0, 0}, "bloom source view, other quad");
+      gfx::bloom::set_view(0);
+      settle();
+      check_efb(5, 32, plainLeft, "bloom off again, left edge");
+      require(!gfx::bloom::holds_targets(), "Bloom targets kept after it was turned off");
+      gfx::bloom::set_light_textures({});
+      std::printf(
+          "Actual Aurora bloom: the listed texture glows either way round and see-through, covered by a "
+          "see-through surface in front, source view, off restores\n");
+    }
+    // An alpha-blended surface moves like any other. It owns the depth only on a GPU that can blend the 32-bit float
+    // target; elsewhere (AURORA_GFX_FLAGS=nofloat32blend hides the feature) it leaves the depth behind it.
+    gfx::request_motion_vectors(true);
+    settle_motion_pipelines(true);
+    draw_motion_frame(.25f, true);
+    check_motion(36, 32, {-8.f, 0.f}, "blended");
+    const auto depthAt = [](unsigned x, unsigned y) {
+      return std::bit_cast<float>(read_texel(webgpu::g_motionDepth.texture, x, y));
+    };
+    require((depthAt(36, 32) != depthAt(4, 32)) == webgpu::g_float32Blendable,
+            webgpu::g_float32Blendable ? "Alpha-blended surface did not own its depth"
+                                       : "Alpha-blended surface wrote depth with no blendable target");
+    std::printf("Actual Aurora alpha-blended motion: moved -8 px, float32-blendable %d\n",
+                webgpu::g_float32Blendable ? 1 : 0);
+    // The blurred picture is what is presented, so a screenshot or frame capture copies it (aurora.cpp
+    // encode_frame_capture).
+    gfx::motion::set_blur(1.f);
+    settle_motion_pipelines();
+    {
+      const auto picture = webgpu::current_present_source();
+      auto encoder = webgpu::g_device.CreateCommandEncoder();
+      const auto blurred = gfx::motion::encode(
+          encoder, picture,
+          gfx::MotionTargets{webgpu::g_motionVectors, webgpu::g_motionDepth, webgpu::g_motionMark}, 1.f);
+      const auto commands = encoder.Finish();
+      webgpu::g_queue.Submit(1, &commands);
+      require(blurred.texture.Get() != picture.texture.Get(), "Motion blur did not replace the picture");
+      require((blurred.texture.GetUsage() & wgpu::TextureUsage::CopySrc) != wgpu::TextureUsage::None,
+              "Blurred picture cannot be copied to a screenshot");
+      require(read_texel(blurred.texture, 32, 32)[0] > 200 && read_texel(blurred.texture, 4, 32)[0] < 50,
+              "Blurred picture does not show the frame");
+    }
+    gfx::motion::set_blur(0.f);
+    draw_motion_frame(0.f);
+    require(!webgpu::g_motionVectors.texture, "Motion vector targets kept after blur was turned off");
+    std::printf("Actual Aurora blurred picture copied for capture\n");
+    // The game's own alpha test: cut-outs are drawn as the game sets them up, in submission order.
+    check_alpha_pixel(run_alpha_order(), 4, {255, 0, 0});
+    for (unsigned variant : {25, 26, 27})
+      check_alpha_pixel(run_alpha_order(variant), 4, {0, 128, 127});
+    for (const auto path : particlePaths) {
+      const auto particles = run_alpha_order(11, path);
+      check_alpha_pixel(particles, 4, {63, 64, 128});
+      check_alpha_pixel(particles, 12, {32, 64, 191});
+      for (unsigned variant : {21, 22, 23, 24}) {
+        const auto pixels = run_alpha_order(variant, path);
+        check_alpha_pixel(pixels, 4, variant == 22 ? std::array{95, 32, 128} :
+                                   variant == 23 ? std::array{0, 127, 128} :
+                                   variant == 24 ? std::array{127, 0, 128} : std::array{63, 64, 128});
+        check_alpha_pixel(pixels, 12, variant == 22 ? std::array{32, 48, 207} :
+                                    variant == 23 ? std::array{32, 95, 160} :
+                                    variant == 24 ? std::array{32, 32, 223} : std::array{32, 64, 191});
+      }
+    }
+    std::puts("Actual Aurora alpha test, translucent order, viewport/scissor and barriers passed");
     const auto control = run(0);
     for (unsigned band = 0; band < 4; ++band) {
       const auto tile = band * 4 * 64;
@@ -274,11 +1504,15 @@ int main(int argc, char** argv) {
     }
     const gfx::StagingSizes physical{gfx::VertexBufferSize, gfx::UniformBufferSize,
                                       gfx::IndexBufferSize, gfx::StorageBufferSize};
-    const auto uniformTail = gx::MaxUniformSize + 32 * gfx::staging_uniform_bytes(48);
+    // The uniform tail the renderer keeps free (gfx::staging_has_space), and room for exactly two clear uniforms
+    // after it, padded to this device's alignment (64 bytes on some GPUs, 256 on others): the third clear must split.
+    const auto uniformTail = gx::MaxUniformSize + gfx::efb_ram::MaxAsyncReadbackSlots * gfx::staging_uniform_bytes(48);
     for (unsigned buffer = 0; buffer < 4; ++buffer) {
       auto limits = physical;
-      limits[buffer] = buffer == 0 ? 128 : buffer == 1 ? uniformTail + 512 :
-                       buffer == 2 ? 24 : 2 * gfx::staging_storage_bytes(48);
+      limits[buffer] = buffer == 0   ? 128
+                       : buffer == 1 ? uniformTail + 2 * gfx::staging_uniform_bytes(16)
+                       : buffer == 2 ? 24
+                                     : 2 * gfx::staging_storage_bytes(48);
       gfx::set_staging_capacity_limits_for_testing(limits);
       const auto before = gfx::staging_split_count();
       require(run(0, false, false, buffer == 1 ? 0 : buffer == 3 ? 2 : 1) == expected(16),
@@ -299,7 +1533,7 @@ int main(int argc, char** argv) {
     require(run(0, false, false, 3) == expected(16), "Raw bridge capacity split changed pixels");
     std::puts("Actual Aurora raw bridge capacity split preserved direct quad pixels");
     limits = physical;
-    limits[1] = uniformTail + 768;
+    limits[1] = uniformTail + 3 * gfx::staging_uniform_bytes(16); // three clear uniforms at this device's alignment
     gfx::set_staging_capacity_limits_for_testing(limits);
     const auto beforeBake = gfx::staging_split_count();
     require(run(0, false, true, 0, true) == expected(16),
@@ -351,6 +1585,7 @@ int main(int argc, char** argv) {
     aurora_set_frame_interpolation_fps(0);
     gfx::set_staging_capacity_limits_for_testing(physical);
     std::puts("Actual Aurora frame worker completed 16 capacity-split perspective frames");
+    check_hdr_present_shader();
     require(errors == 0, "Renderer reported an error");
   } catch (const std::exception& error) {
     std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -265,8 +265,7 @@ static constexpr std::string_view FragRA8 = R"(
 )"sv;
 
 // GX_CTF_A8: 8-bit alpha -> R8Unorm. Only the RGBA6 EFB has alpha, and it keeps 6 bits: a copy reads them back as
-// a6 << 2 | a6 >> 4. Games compare against that exact value (Scooby-Doo! Unmasked's darkening pass keeps pixels whose
-// alpha equals its marker); full 8-bit alpha missed the match and dimmed the whole screen at some camera positions.
+// a6 << 2 | a6 >> 4, the value games compare against.
 static constexpr std::string_view FragA8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let a6 = floor(sample_copy(in.uv).a * 63.0 + 0.5);

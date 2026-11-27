@@ -1,4 +1,4 @@
-﻿#include "frame_interpolation.hpp"
+#include "frame_interpolation.hpp"
 
 #include "../internal.hpp"
 #include "aurora/gfx.h"
@@ -22,6 +22,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace aurora {
+extern std::atomic<uint64_t> g_presentScheduleBaseNanos; // aurora.cpp
+} // namespace aurora
 
 namespace aurora::gx {
 namespace detail {
@@ -160,6 +164,9 @@ struct FrameTransformSnapshot {
 struct FrameTransformEntry {
   FrameInterpolationDrawIdentity identity;
   FrameTransformSnapshot transform;
+  // Motion vectors, vertex history: this frame's copy of the draw's POS array, kept when its contents changed since
+  // last frame (a CPU-animated model), for next frame's previous positions.
+  std::shared_ptr<const std::vector<uint8_t>> posHistory;
   // Constant-velocity prediction of a non-indexed transform, so repeated meshes match
   // on where they will be. Not for indexed draws: PNMTXIDX slot identity pairs those.
   Mat3x4<float> predictedPosition{};
@@ -185,6 +192,7 @@ struct PendingUniformInterpolation {
   uint32_t numerator = 0;
   uint32_t denominator = 1;
   bool indexedMatrices = false;
+  size_t motionPrevOffset = SIZE_MAX; // where the draw's motion block starts, if it has one
 };
 
 std::vector<FrameTransformEntry> s_previousFrameTransforms;
@@ -225,6 +233,11 @@ bool s_previousFrameHasIndexedMatrices = false;
 // Hands the frame that just sealed to the next frame's matching and returns
 // the retiring one's matrix blocks to the pool.
 void retire_frame_transforms() noexcept {
+  // Motion vectors: a frame with no perspective draws (the game presenting without drawing the scene) keeps the last
+  // frame that had them as "previous"; otherwise the next frame finds nothing to pair with and shows no motion at all.
+  if (s_currentFrameTransforms.empty() && !s_previousFrameTransforms.empty() && gfx::motion_vectors_active()) {
+    return;
+  }
   s_previousFrameHasIndexedMatrices =
       std::any_of(s_currentFrameTransforms.begin(), s_currentFrameTransforms.end(),
                   [](const FrameTransformEntry& entry) noexcept {
@@ -252,6 +265,15 @@ uint32_t s_perspectiveCandidates = 0;
 uint32_t s_perspectiveMatchable = 0;
 uint32_t s_perspectiveMatches = 0;
 std::vector<PendingUniformInterpolation> s_pendingUniformInterpolations;
+
+// Motion vectors: a draw's previous-transform block, rewritten with last frame's matrices at seal.
+struct PendingMotionUniform {
+  size_t currentTransformIndex = 0;
+  uint8_t* data = nullptr; // vec4 viewport, mat4x4 projection, then the position region
+  size_t currentMatrix = 0;
+  bool indexedMatrices = false;
+};
+std::vector<PendingMotionUniform> s_pendingMotionUniforms;
 std::atomic_bool s_hasInterpolatedFrame{false};
 std::atomic_bool s_frameInterpolationReplaySafe{true};
 uint32_t s_previousInterpolationFps = 0;
@@ -294,6 +316,16 @@ HashType stable_identity(const FrameInterpolationDrawIdentity& identity) noexcep
   return combine_identity(combine_identity(identity.pipeline, identity.texture),
                           identity.matrixTopology);
 }
+
+// Motion vectors' last-resort pairing key. Textures are left out: for motion only the transform matters, and a draw
+// that samples a texture which changes from frame to frame (an EFB copy from a rotating pool, such as a shadow)
+// matches on neither of the identities above.
+HashType motion_identity(const FrameInterpolationDrawIdentity& identity) noexcept {
+  return combine_identity(identity.pipeline, identity.matrixTopology);
+}
+std::unordered_map<HashType, std::vector<size_t>> s_previousMotionTransformIndices;
+// Previous-frame entries already given to a motion draw this frame (before and after a mid-frame split).
+std::vector<uint8_t> s_motionClaimed;
 
 float dot3(const std::array<float, 3>& a, const std::array<float, 3>& b) noexcept {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -789,6 +821,11 @@ void report_producer_paced(bool paced) noexcept {
   s_pacingWindowMisses.store(0, std::memory_order_release);
 }
 
+// Motion vectors, HUD (defined with note_motion_draw).
+void flag_motion_hud() noexcept;
+void drop_motion_draws() noexcept;
+void reset_motion_draws() noexcept;
+
 void begin_frame_interpolation() noexcept {
   const uint32_t targetFps = frame_interpolation_fps();
   if (targetFps != s_previousInterpolationFps) {
@@ -804,18 +841,28 @@ void begin_frame_interpolation() noexcept {
   // Normally empty (finalize swapped and recycled); an aborted frame can leave
   // entries behind, whose matrix blocks go back to the pool here.
   recycle_transform_entries(s_currentFrameTransforms);
-  // Keep buckets, nodes and capacities across frames so a stable race scene does not
+  // Keep buckets, nodes and capacities across frames so a stable scene does not
   // pay thousands of small allocations every frame.
   clear_index_map_keep_nodes(s_previousTransformIndices, s_previousFrameTransforms.size());
   clear_index_map_keep_nodes(s_previousStableTransformIndices, s_previousFrameTransforms.size());
+  const bool motionVectors = gfx::motion_vectors_active();
+  if (motionVectors) {
+    clear_index_map_keep_nodes(s_previousMotionTransformIndices, s_previousFrameTransforms.size());
+    s_motionClaimed.assign(s_previousFrameTransforms.size(), 0);
+  }
   for (size_t i = 0; i < s_previousFrameTransforms.size(); ++i) {
     const auto& identity = s_previousFrameTransforms[i].identity;
     s_previousTransformIndices[identity.combined].push_back(i);
     s_previousStableTransformIndices[stable_identity(identity)].push_back(i);
+    if (motionVectors) {
+      s_previousMotionTransformIndices[motion_identity(identity)].push_back(i);
+    }
   }
   clear_index_map_keep_nodes(s_currentTransformIndices, s_previousFrameTransforms.size());
   clear_index_map_keep_nodes(s_currentStableTransformIndices, s_previousFrameTransforms.size());
   s_pendingUniformInterpolations.clear();
+  s_pendingMotionUniforms.clear();
+  reset_motion_draws();
   s_perspectiveCandidates = 0;
   s_perspectiveMatchable = 0;
   s_perspectiveMatches = 0;
@@ -823,13 +870,404 @@ void begin_frame_interpolation() noexcept {
   s_frameInterpolationReplaySafe.store(true, std::memory_order_release);
 }
 
+// ----- Motion vectors (gfx::motion_vectors_active): last frame's matrices for each draw's previous-transform block.
+
+constexpr size_t kMotionPrevPosOffset = sizeof(Vec4<float>); // vec4u: previous POS array offset, flags, image's share
+constexpr size_t kMotionImageShareOffset = kMotionPrevPosOffset + 2 * sizeof(uint32_t); // the share, a float
+constexpr size_t kMotionProjectionOffset = kMotionPrevPosOffset + sizeof(Vec4<uint32_t>);
+constexpr size_t kMotionPositionOffset = kMotionProjectionOffset + sizeof(Mat4x4<float>);
+
+// Pairing by distance has to leave the camera's own motion out: copies of one mesh share an identity (the shadow blob
+// under every character, repeated fence posts), and in view space a turning camera moves each copy by its distance
+// times the turn, so nearest-translation swapped copies (a shadow got the spider's shadow as its "previous" and
+// flashed). Draws whose identity is unique in both frames (static world chunks, mostly) each give the camera's change,
+// D = current * previous^-1; the one most of them agree on is used to predict where a draw was last frame if it stood
+// still, D^-1 * current, and candidates are compared with that.
+using Affine = std::array<float, 12>; // row-major 3x4: rotation/scale, translation in column 3
+
+// The camera's change is taken from at most this many unique draws a frame, and per viewport at most this many are
+// compared with each other (all against all).
+constexpr size_t kCameraDeltaMaxCandidates = 512;
+constexpr size_t kCameraDeltaMaxCompared = 96;
+// It counts when at least this many of them agree, and at least one in this many.
+constexpr uint32_t kCameraDeltaMinAgreeing = 2;
+constexpr uint32_t kCameraDeltaMinAgreeingOneIn = 4;
+// Two changes agree when their rotation/scale elements differ by at most this much, and their translations by at
+// most a fixed amount plus a share of the distance moved (world units).
+constexpr float kAffineRotationTolerance = 0.01f;
+constexpr float kAffineTranslationTolerance = 0.02f;
+constexpr float kAffineTranslationShareTolerance = 0.01f;
+// Those are wide enough for a slow camera turn (under about 0.57 degrees a frame) to agree with no turn at all: draws
+// attached to the camera and the world's draws then all tie, and the first one in draw order won, so the camera read as
+// still. The winner is picked again among those that agreed with it, with these, by how many match it this closely.
+constexpr float kAffineRotationTightTolerance = 0.001f;
+constexpr float kAffineTranslationTightTolerance = 0.002f;
+constexpr float kAffineTranslationShareTightTolerance = 0.001f;
+
+Affine to_affine(const Mat3x4<float>& m) noexcept {
+  Affine a;
+  std::memcpy(a.data(), &m, sizeof(a));
+  return a;
+}
+
+Affine affine_mul(const Affine& a, const Affine& b) noexcept {
+  Affine r{};
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      float v = col == 3 ? a[row * 4 + 3] : 0.f;
+      for (int k = 0; k < 3; ++k) {
+        v += a[row * 4 + k] * b[k * 4 + col];
+      }
+      r[row * 4 + col] = v;
+    }
+  }
+  return r;
+}
+
+bool affine_inverse(const Affine& a, Affine& out) noexcept {
+  const float m00 = a[0], m01 = a[1], m02 = a[2], m10 = a[4], m11 = a[5], m12 = a[6], m20 = a[8], m21 = a[9],
+              m22 = a[10];
+  const float c00 = m11 * m22 - m12 * m21, c01 = m12 * m20 - m10 * m22, c02 = m10 * m21 - m11 * m20;
+  const float det = m00 * c00 + m01 * c01 + m02 * c02;
+  if (!std::isfinite(det) || std::fabs(det) < 1e-12f) {
+    return false;
+  }
+  const float inv = 1.f / det;
+  const std::array<float, 9> r{c00 * inv, (m02 * m21 - m01 * m22) * inv, (m01 * m12 - m02 * m11) * inv,
+                               c01 * inv, (m00 * m22 - m02 * m20) * inv, (m02 * m10 - m00 * m12) * inv,
+                               c02 * inv, (m01 * m20 - m00 * m21) * inv, (m00 * m11 - m01 * m10) * inv};
+  for (int row = 0; row < 3; ++row) {
+    out[row * 4 + 0] = r[row * 3 + 0];
+    out[row * 4 + 1] = r[row * 3 + 1];
+    out[row * 4 + 2] = r[row * 3 + 2];
+    out[row * 4 + 3] = -(r[row * 3 + 0] * a[3] + r[row * 3 + 1] * a[7] + r[row * 3 + 2] * a[11]);
+  }
+  return true;
+}
+
+bool affine_close(const Affine& a, const Affine& b, float rotationTolerance = kAffineRotationTolerance,
+                  float translationTolerance = kAffineTranslationTolerance,
+                  float translationShareTolerance = kAffineTranslationShareTolerance) noexcept {
+  for (int row = 0; row < 3; ++row) {
+    for (int k = 0; k < 3; ++k) {
+      if (std::fabs(a[row * 4 + k] - b[row * 4 + k]) > rotationTolerance) {
+        return false;
+      }
+    }
+  }
+  const float dx = a[3] - b[3], dy = a[7] - b[7], dz = a[11] - b[11];
+  const float t = std::sqrt(a[3] * a[3] + a[7] * a[7] + a[11] * a[11]);
+  const float tolerance = translationTolerance + translationShareTolerance * t;
+  return dx * dx + dy * dy + dz * dz <= tolerance * tolerance;
+}
+
+// A camera cut: the game never says when it cuts, so a camera change far beyond any real camera motion in one frame
+// counts as one. Its frame gets no motion at all (paired, a cut's draws would each "move" the whole jump and the blur
+// would smear the frame from edge to edge). Measured per frame at 60 fps: play in e001 and i004 at most 0.9 degrees
+// and 0.084 units; the dev menu's free camera spinning 15 degrees or moving 0.5 units every frame (steady motion,
+// which keeps its blur); cuts 40 to 179 degrees or 5 to 105 units. A turn of more than 90 degrees never pairs at all
+// (kMinimumQuaternionDot), so these limits matter for the smaller cuts.
+constexpr float kCameraCutCosTurn = 0.8660254f; // cos(30 degrees)
+constexpr float kCameraCutMove = 2.0f;          // world units
+
+struct MotionCameraDelta {
+  HashType viewport = 0;
+  Affine inverse{}; // D^-1: last frame's matrix of a still draw = inverse * this frame's
+  bool cut = false;
+};
+
+// D (the camera's change, current * previous^-1) turns more than 30 degrees or moves more than kCameraCutMove.
+bool camera_cut(const Affine& delta) noexcept {
+  const float cosTurn = (delta[0] + delta[5] + delta[10] - 1.f) * 0.5f;
+  const float move = delta[3] * delta[3] + delta[7] * delta[7] + delta[11] * delta[11];
+  return !(cosTurn >= kCameraCutCosTurn) || !(move <= kCameraCutMove * kCameraCutMove);
+}
+std::vector<MotionCameraDelta> s_motionCameraDeltas;
+
+// The camera's change for every viewport, from the draws recorded so far (see above).
+void estimate_motion_camera_deltas() {
+  s_motionCameraDeltas.clear();
+  struct Candidate {
+    HashType viewport;
+    Affine delta;
+  };
+  static std::vector<Candidate> candidates;
+  candidates.clear();
+  for (size_t i = 0; i < s_currentFrameTransforms.size() && candidates.size() < kCameraDeltaMaxCandidates; ++i) {
+    const auto& entry = s_currentFrameTransforms[i];
+    if (entry.transform.indexedMatrices) {
+      continue;
+    }
+    const auto currentIt = s_currentTransformIndices.find(entry.identity.combined);
+    const auto previousIt = s_previousTransformIndices.find(entry.identity.combined);
+    if (currentIt == s_currentTransformIndices.end() || currentIt->second.size() != 1 ||
+        previousIt == s_previousTransformIndices.end() || previousIt->second.size() != 1) {
+      continue;
+    }
+    const auto& previous = s_previousFrameTransforms[previousIt->second.front()].transform;
+    Affine previousInverse;
+    if (previous.indexedMatrices || !affine_inverse(to_affine(previous.position), previousInverse)) {
+      continue;
+    }
+    candidates.push_back(
+        {entry.transform.viewportIdentity, affine_mul(to_affine(entry.transform.position), previousInverse)});
+  }
+  // Per viewport, the candidate most others agree with (a bounded number compared, so it stays cheap).
+  std::vector<uint8_t> done(candidates.size(), 0);
+  for (size_t a = 0; a < candidates.size(); ++a) {
+    if (done[a]) {
+      continue;
+    }
+    std::vector<size_t> group;
+    for (size_t b = a; b < candidates.size(); ++b) {
+      if (!done[b] && candidates[b].viewport == candidates[a].viewport) {
+        done[b] = 1;
+        if (group.size() < kCameraDeltaMaxCompared) {
+          group.push_back(b);
+        }
+      }
+    }
+    size_t best = SIZE_MAX;
+    uint32_t bestSupport = 0;
+    for (const size_t x : group) {
+      uint32_t support = 0;
+      for (const size_t y : group) {
+        support += affine_close(candidates[x].delta, candidates[y].delta) ? 1u : 0u;
+      }
+      if (support > bestSupport) {
+        bestSupport = support;
+        best = x;
+      }
+      if (support * 2 > group.size()) {
+        break; // A majority agrees: this runs every frame, so stop looking.
+      }
+    }
+    MotionCameraDelta result{.viewport = candidates[a].viewport};
+    if (best != SIZE_MAX && bestSupport >= kCameraDeltaMinAgreeing &&
+        bestSupport * kCameraDeltaMinAgreeingOneIn >= group.size()) {
+      // The second vote (see kAffineRotationTightTolerance), among the candidates that agreed.
+      static std::vector<size_t> agreeing;
+      agreeing.clear();
+      for (const size_t x : group) {
+        if (affine_close(candidates[best].delta, candidates[x].delta)) {
+          agreeing.push_back(x);
+        }
+      }
+      size_t winner = best;
+      uint32_t winnerSupport = 0;
+      for (const size_t x : agreeing) {
+        uint32_t support = 0;
+        for (const size_t y : agreeing) {
+          support += affine_close(candidates[x].delta, candidates[y].delta, kAffineRotationTightTolerance,
+                                  kAffineTranslationTightTolerance, kAffineTranslationShareTightTolerance)
+                         ? 1u
+                         : 0u;
+        }
+        if (support > winnerSupport) {
+          winnerSupport = support;
+          winner = x;
+        }
+        if (support * 2 > agreeing.size()) {
+          break;
+        }
+      }
+      if (affine_inverse(candidates[winner].delta, result.inverse)) {
+        result.cut = camera_cut(candidates[winner].delta);
+        s_motionCameraDeltas.push_back(result);
+      }
+    }
+  }
+}
+
+const MotionCameraDelta* motion_camera_delta(HashType viewport) noexcept {
+  for (const auto& delta : s_motionCameraDeltas) {
+    if (delta.viewport == viewport) {
+      return &delta;
+    }
+  }
+  return nullptr;
+}
+
+// This frame's camera cut for the viewport (see kCameraCutCosTurn): its draws keep this frame's matrices, no motion.
+bool motion_camera_cut(HashType viewport) noexcept {
+  const auto* delta = motion_camera_delta(viewport);
+  return delta != nullptr && delta->cut;
+}
+
+// Where a one-matrix draw would have been last frame if it stood still in the world (camera motion left out, see
+// above).
+Mat3x4<float> predicted_still(const FrameTransformSnapshot& current) noexcept {
+  Mat3x4<float> predicted = current.position;
+  if (const auto* delta = motion_camera_delta(current.viewportIdentity)) {
+    const Affine p = affine_mul(delta->inverse, to_affine(current.position));
+    std::memcpy(&predicted, p.data(), sizeof(predicted));
+  }
+  return predicted;
+}
+
+// Last frame's partner for a motion draw from one identity group, skipping claimed entries: a skinned draw takes
+// its own occurrence in the group (else the first free one) with a palette, a one-matrix draw the free one nearest
+// to where it would be if it stood still (camera motion left out, see above). SIZE_MAX if none.
+size_t pick_motion_partner(const std::vector<size_t>& candidates, size_t ordinal, const FrameTransformSnapshot& current,
+                           bool indexed) noexcept {
+  if (s_motionClaimed.size() < s_previousFrameTransforms.size()) {
+    s_motionClaimed.resize(s_previousFrameTransforms.size(), 0);
+  }
+  const auto free = [&](size_t index) {
+    return index < s_previousFrameTransforms.size() && !s_motionClaimed[index] &&
+           (s_previousFrameTransforms[index].transform.indexedMatrices != nullptr) == indexed;
+  };
+  if (indexed) {
+    if (ordinal < candidates.size() && free(candidates[ordinal])) {
+      return candidates[ordinal];
+    }
+    for (const size_t index : candidates) {
+      if (free(index)) {
+        return index;
+      }
+    }
+    return SIZE_MAX;
+  }
+  const Mat3x4<float> predicted = predicted_still(current);
+  size_t best = SIZE_MAX;
+  float bestDistance = kMaximumTranslationPerFrame * kMaximumTranslationPerFrame;
+  for (const size_t index : candidates) {
+    if (!free(index)) {
+      continue;
+    }
+    const float distance = translation_delta_squared(s_previousFrameTransforms[index].transform.position, predicted);
+    if (distance <= bestDistance) {
+      bestDistance = distance;
+      best = index;
+    }
+  }
+  return best;
+}
+
+// Last resort for a draw nothing pairs with (geometry rebuilt every frame, like the ground the game redraws under each
+// character with its shadow, or something that just appeared): assume it stands still in the world, so it gets the
+// camera's motion instead of none.
+void write_motion_still(const PendingMotionUniform& task, const FrameTransformSnapshot& current) noexcept {
+  const auto* delta = motion_camera_delta(current.viewportIdentity);
+  if (delta == nullptr || delta->cut) {
+    return;
+  }
+  const auto still = [&](const Mat3x4<float>& matrix, size_t slot) {
+    const Affine previous = affine_mul(delta->inverse, to_affine(matrix));
+    std::memcpy(task.data + kMotionPositionOffset + slot * sizeof(Mat3x4<float>), previous.data(),
+                sizeof(Mat3x4<float>));
+  };
+  std::memcpy(task.data + kMotionProjectionOffset, &current.projection, sizeof(Mat4x4<float>));
+  if (task.indexedMatrices) {
+    for (size_t slot = 0; slot < MaxPnMtx; ++slot) {
+      if ((current.usedMatrixMask & (1u << slot)) != 0) {
+        still(current.indexedMatrices->position[slot], slot);
+      }
+    }
+  } else {
+    still(current.position, task.currentMatrix);
+  }
+}
+
+// Pairs one motion draw: its exact identity group, then the stable one, then the motion-only one. A one-matrix draw
+// with an exact match takes the nearer of it and the nearest copy in the stable group. Claims the partner.
+size_t pair_motion_draw(size_t currentIndex, bool indexed) noexcept {
+  const auto& entry = s_currentFrameTransforms[currentIndex];
+  const auto search = [&](const auto& currentGroups, const auto& previousGroups, HashType key) {
+    const auto previousIt = previousGroups.find(key);
+    if (previousIt == previousGroups.end()) {
+      return SIZE_MAX;
+    }
+    size_t ordinal = SIZE_MAX;
+    if (const auto currentIt = currentGroups.find(key); currentIt != currentGroups.end()) {
+      const auto& group = currentIt->second;
+      ordinal = static_cast<size_t>(std::find(group.begin(), group.end(), currentIndex) - group.begin());
+    }
+    return pick_motion_partner(previousIt->second, ordinal, entry.transform, indexed);
+  };
+  size_t best = search(s_currentTransformIndices, s_previousTransformIndices, entry.identity.combined);
+  if (best == SIZE_MAX) {
+    best = search(s_currentStableTransformIndices, s_previousStableTransformIndices, stable_identity(entry.identity));
+  } else if (!indexed) {
+    // The exact identity hashes the positions, so a mesh the game animates on the CPU (the f001 fish paste: six barrels
+    // of it, out of step) gets a new one every frame, and it can equal last frame's shape of another copy of the mesh:
+    // the exact match is then a different copy (51 to 68 units away in f001), and the draw flashed full motion. For
+    // one-matrix draws the nearest copy of the mesh wins; for a mesh that is not animated that is the exact match.
+    const size_t nearest =
+        search(s_currentStableTransformIndices, s_previousStableTransformIndices, stable_identity(entry.identity));
+    if (nearest != SIZE_MAX && nearest != best) {
+      const auto predicted = predicted_still(entry.transform);
+      if (translation_delta_squared(s_previousFrameTransforms[nearest].transform.position, predicted) <
+          translation_delta_squared(s_previousFrameTransforms[best].transform.position, predicted)) {
+        best = nearest;
+      }
+    }
+  }
+  if (best == SIZE_MAX) {
+    if (const auto it = s_previousMotionTransformIndices.find(motion_identity(entry.identity));
+        it != s_previousMotionTransformIndices.end()) {
+      best = pick_motion_partner(it->second, SIZE_MAX, entry.transform, indexed);
+    }
+  }
+  if (best != SIZE_MAX) {
+    s_motionClaimed[best] = 1;
+  }
+  return best;
+}
+
+// A skinned draw's slots that last frame's draw didn't use keep this frame's matrix (no motion for their vertices).
+void write_motion_partner(const PendingMotionUniform& task, const FrameTransformSnapshot& current,
+                          const FrameTransformSnapshot& previous) noexcept {
+  std::memcpy(task.data + kMotionProjectionOffset, &previous.projection, sizeof(Mat4x4<float>));
+  if (task.indexedMatrices) {
+    for (size_t slot = 0; slot < MaxPnMtx; ++slot) {
+      if ((current.usedMatrixMask & previous.usedMatrixMask & (1u << slot)) != 0) {
+        std::memcpy(task.data + kMotionPositionOffset + slot * sizeof(Mat3x4<float>),
+                    &previous.indexedMatrices->position[slot], sizeof(Mat3x4<float>));
+      }
+    }
+  } else {
+    std::memcpy(task.data + kMotionPositionOffset + task.currentMatrix * sizeof(Mat3x4<float>), &previous.position,
+                sizeof(Mat3x4<float>));
+  }
+}
+
+// The most a paired draw may move, per second of game time (world units). Pairing by mesh alone gave any leftover copy
+// any other as a partner: when one Scooby snack stops being drawn and another starts in the same frame, the in-between
+// frames drew a snack in mid-air between the two, 17 and 22 units from either (i001). Measured with the camera left out,
+// at 60 Hz, walking in e001 and i004 and standing in i001: real motion peaks at 0.54 units a frame (32 a second, a
+// collected snack flying up). Half of this game's pickups have a neighbour within 2 units, so this is kept low. Refusing
+// a real pair costs little: the draw shows its end position in the in-between frames.
+constexpr float kMaximumDrawSpeed = 60.0f;
+// The step when the game gives no present schedule: one retrace.
+constexpr float kDefaultFrameStepSeconds = 1.0f / 60.0f;
+// Anchor of the last sealed frame's schedule, for the time this frame covers. The game steps by measured time, so a
+// frame two retraces after the last has a real move twice as long. (The game keeps interpolation off with fps60 off,
+// where every frame is like this.)
+uint64_t s_lastSealedAnchorNanos = 0;
+
+// The time this frame covers, from the anchors of the present schedule.
+float seal_frame_step_seconds() noexcept {
+  const uint64_t anchor = g_presentScheduleBaseNanos.load(std::memory_order_acquire);
+  const uint64_t last = s_lastSealedAnchorNanos;
+  s_lastSealedAnchorNanos = anchor;
+  return last != 0 && anchor > last ? static_cast<float>(anchor - last) * 1.0e-9f : kDefaultFrameStepSeconds;
+}
+
 void finalize_frame_interpolation() noexcept {
+  // Interpolation never pauses on match quality: an unmatched draw just renders its
+  // end-frame state, while a ratio gate flapped the whole output cadence instead.
+  const bool eligible = frame_interpolation_fps() != 0;
+  const float frameStepSeconds = eligible ? seal_frame_step_seconds() : kDefaultFrameStepSeconds;
   // A frame reported late seals without inserted slots, so the encode phase renders
   // the native frame only. Its transforms still seed the next frame's matching.
   if (s_dropInterpolationAtSeal.exchange(false, std::memory_order_acq_rel)) {
     s_diagLateSealDrops.fetch_add(1, std::memory_order_relaxed);
     s_hasInterpolatedFrame.store(false, std::memory_order_release);
     s_pendingUniformInterpolations.clear();
+    s_pendingMotionUniforms.clear();
+    flag_motion_hud();
+    reset_motion_draws();
     retire_frame_transforms();
     return;
   }
@@ -887,6 +1325,45 @@ void finalize_frame_interpolation() noexcept {
            static_cast<uint64_t>(cz);
   };
 
+  // The camera's change, for the move check below and for motion vectors. Neither runs with both off.
+  if (eligible || !s_pendingMotionUniforms.empty()) {
+    estimate_motion_camera_deltas();
+  }
+  const float maximumDrawMove = kMaximumDrawSpeed * frameStepSeconds;
+  // A one-matrix draw with the camera's motion left out (see predicted_still); null where there's no camera estimate,
+  // since nothing tells a moving camera from moving draws there. Every edge of a draw asks, so the last answer is kept.
+  size_t stillIndex = SIZE_MAX;
+  bool stillKnown = false;
+  Mat3x4<float> stillPosition{};
+  const auto drawStill = [&](size_t currentIndex) noexcept -> const Mat3x4<float>* {
+    if (stillIndex != currentIndex) {
+      stillIndex = currentIndex;
+      const auto& current = s_currentFrameTransforms[currentIndex].transform;
+      stillKnown = eligible && !current.indexedMatrices && motion_camera_delta(current.viewportIdentity) != nullptr;
+      if (stillKnown) {
+        stillPosition = predicted_still(current);
+      }
+    }
+    return stillKnown ? &stillPosition : nullptr;
+  };
+  // Whether a one-matrix draw can be last frame's draw: it moved no further than the limit, either with the camera
+  // (attached to it, like Scooby under a following camera: still in view space) or in the world (the camera left out).
+  // Checked where pairs are made, so a refused pair leaves both draws free for a real partner, in this group or the
+  // stable one. Skinned draws have no one translation, and only interpolation needs the check.
+  const auto movePlausible = [&](size_t previousIndex, size_t currentIndex) noexcept {
+    const auto& previous = s_previousFrameTransforms[previousIndex].transform;
+    const auto& current = s_currentFrameTransforms[currentIndex].transform;
+    if (!eligible || previous.indexedMatrices || current.indexedMatrices) {
+      return true;
+    }
+    const float maximumMoveSquared = maximumDrawMove * maximumDrawMove;
+    if (translation_delta_squared(previous.position, current.position) <= maximumMoveSquared) {
+      return true;
+    }
+    const Mat3x4<float>* still = drawStill(currentIndex);
+    return still == nullptr || translation_delta_squared(previous.position, *still) <= maximumMoveSquared;
+  };
+
   const auto matchGroups =
       [&](const auto& currentGroups, const auto& previousGroups,
           bool allowOrderedFallback) {
@@ -914,9 +1391,12 @@ void finalize_frame_interpolation() noexcept {
         continue;
       }
 
-      // A unique draw has no identity ambiguity. Keep the conservative
-      // interpolation fallback for malformed/non-finite matrices.
+      // One draw on each side still needs the move check: they can be two copies of a mesh, one leaving and one
+      // entering. Keep the conservative interpolation fallback for malformed/non-finite matrices.
       if (groupPreviousIndices.size() == 1 && groupCurrentIndices.size() == 1) {
+        if (!movePlausible(groupPreviousIndices.front(), groupCurrentIndices.front())) {
+          continue;
+        }
         currentToPrevious[groupCurrentIndices.front()] = groupPreviousIndices.front();
         previousMatched[groupPreviousIndices.front()] = 1;
         currentMatched[groupCurrentIndices.front()] = 1;
@@ -934,7 +1414,16 @@ void finalize_frame_interpolation() noexcept {
               kMaximumTranslationPerFrame * kMaximumTranslationPerFrame)) {
           return;
         }
-        const float distance = snapshot_match_distance_squared(previousEntry, currentSnapshot);
+        if (!movePlausible(previousIndex, currentIndex)) {
+          return;
+        }
+        float distance = snapshot_match_distance_squared(previousEntry, currentSnapshot);
+        // Near in the world counts too: in a camera turn a distant draw moves further in view space than the gap to the
+        // next copy in a row, so view-space nearest alone takes the neighbour's partner (e002 snacks: 69 units away, 1.66
+        // apart, 0.9 degrees a frame). Prediction can't save it: it starts from the frame before the turn or a wrong pair.
+        if (const Mat3x4<float>* still = drawStill(currentIndex); still != nullptr && !previousEntry.transform.indexedMatrices) {
+          distance = std::min(distance, transform_match_distance_squared(previousEntry.transform.position, *still));
+        }
         if (std::isfinite(distance)) {
           edges.push_back({
               .distance = distance,
@@ -961,6 +1450,9 @@ void finalize_frame_interpolation() noexcept {
               !(translation_delta_squared(previousEntry.transform.position,
                                           currentEntry.transform.position) <=
                 kMaximumTranslationPerFrame * kMaximumTranslationPerFrame)) {
+            continue;
+          }
+          if (!movePlausible(groupPreviousIndices[i], groupCurrentIndices[i])) {
             continue;
           }
           currentToPrevious[groupCurrentIndices[i]] = groupPreviousIndices[i];
@@ -1077,10 +1569,6 @@ void finalize_frame_interpolation() noexcept {
   s_perspectiveMatches = static_cast<uint32_t>(std::count_if(
       currentToPrevious.begin(), currentToPrevious.end(),
       [](size_t previousIndex) { return previousIndex != SIZE_MAX; }));
-  // Interpolation never pauses on match quality: an unmatched draw just renders its
-  // end-frame state, while a ratio gate flapped the whole output cadence instead.
-  const bool eligible = frame_interpolation_fps() != 0;
-
   // Overlay observability: the live match ratio, and how often the scene sits in
   // low-match territory where inserted slots mostly duplicate draws.
   {
@@ -1128,7 +1616,7 @@ void finalize_frame_interpolation() noexcept {
     }
   }
 
-  if (eligible) {
+  if (eligible || !s_pendingMotionUniforms.empty()) {
     // Prepare each matched pair once: every sample of a draw shares the same
     // previous/current matrices. A flat vector keeps the sample tasks parallel.
     std::vector<PreparedTransformInterpolation> preparedTransforms(s_currentFrameTransforms.size());
@@ -1309,6 +1797,11 @@ void finalize_frame_interpolation() noexcept {
 
       const auto& current = s_currentFrameTransforms[task.currentTransformIndex].transform;
       std::memcpy(task.uniformData, task.sourceUniformData, task.uniformSize);
+      const float weight =
+          static_cast<float>(task.numerator) / static_cast<float>(task.denominator);
+      if (task.motionPrevOffset != SIZE_MAX) {
+        std::memcpy(task.uniformData + task.motionPrevOffset + kMotionImageShareOffset, &weight, sizeof(weight));
+      }
       const auto& prepared = preparedTransforms[task.currentTransformIndex];
       if (task.indexedMatrices && !prepared.indexedValid) {
         return;
@@ -1320,8 +1813,6 @@ void finalize_frame_interpolation() noexcept {
         return;
       }
       const auto& previous = s_previousFrameTransforms[previousTransformIndex].transform;
-      const float weight =
-          static_cast<float>(task.numerator) / static_cast<float>(task.denominator);
       const auto interpolatedProjection =
           interpolate_projection(previous.projection, current.projection, weight);
       std::memcpy(task.uniformData + task.projectionOffset, &interpolatedProjection,
@@ -1354,6 +1845,60 @@ void finalize_frame_interpolation() noexcept {
         interpolateMatrixSlot(task.currentMatrix, prepared.nonIndexedPairOffset);
       }
     };
+    // Motion vectors: last frame's exact matrices (no interpolation) into each draw's block. Skinned draws use the
+    // palette resolution above; everything else (and a skinned draw it left unresolved) pair_motion_draw. A draw
+    // with no partner keeps this frame's matrices: no motion. Before the interpolated copies below are made (they copy
+    // the whole block), so an interpolated frame's motion also reaches back to last frame, and the HUD is flagged in
+    // them too.
+    for (const auto& task : s_pendingMotionUniforms) {
+      if (task.currentTransformIndex >= s_currentFrameTransforms.size()) {
+        continue;
+      }
+      const auto& entry = s_currentFrameTransforms[task.currentTransformIndex];
+      const auto& current = entry.transform;
+      if (task.indexedMatrices != (current.indexedMatrices != nullptr)) {
+        continue;
+      }
+      if (motion_camera_cut(current.viewportIdentity)) {
+        continue; // a camera cut: this frame's matrices, no motion
+      }
+      bool paired = false;
+      if (task.indexedMatrices) {
+        const int32_t palette = paletteDrawIndex[task.currentTransformIndex];
+        const size_t projectionEntry = palette >= 0 ? resolvedProjectionEntry[palette] : SIZE_MAX;
+        bool allSlots = projectionEntry < s_previousFrameTransforms.size();
+        for (size_t slot = 0; slot < MaxPnMtx && allSlots; ++slot) {
+          if ((current.usedMatrixMask & (1u << slot)) != 0 &&
+              resolvedSlots[static_cast<size_t>(palette) * MaxPnMtx + slot].position == nullptr) {
+            allSlots = false;
+          }
+        }
+        if (allSlots) {
+          std::memcpy(task.data + kMotionProjectionOffset,
+                      &s_previousFrameTransforms[projectionEntry].transform.projection, sizeof(Mat4x4<float>));
+          for (size_t slot = 0; slot < MaxPnMtx; ++slot) {
+            if ((current.usedMatrixMask & (1u << slot)) != 0) {
+              std::memcpy(task.data + kMotionPositionOffset + slot * sizeof(Mat3x4<float>),
+                          resolvedSlots[static_cast<size_t>(palette) * MaxPnMtx + slot].position,
+                          sizeof(Mat3x4<float>));
+            }
+          }
+          paired = true;
+        }
+      }
+      if (!paired) {
+        const size_t partner = pair_motion_draw(task.currentTransformIndex, task.indexedMatrices);
+        if (partner != SIZE_MAX) {
+          write_motion_partner(task, current, s_previousFrameTransforms[partner].transform);
+          paired = true;
+        }
+      }
+      if (!paired) {
+        write_motion_still(task, current);
+      }
+    }
+    flag_motion_hud();
+
     // A handful of tasks costs more to schedule than to run. The pool stands in for
     // std::execution::par, which libc++ does not provide at all.
     constexpr size_t kMinimumParallelInterpolationTasks = 64;
@@ -1366,6 +1911,9 @@ void finalize_frame_interpolation() noexcept {
           [&](size_t index) { interpolatePendingUniform(s_pendingUniformInterpolations[index]); });
     }
   }
+  s_pendingMotionUniforms.clear();
+  flag_motion_hud();
+  reset_motion_draws();
   s_hasInterpolatedFrame.store(eligible, std::memory_order_release);
   s_pendingUniformInterpolations.clear();
   // The index maps are emptied node-preservingly by the next
@@ -1403,10 +1951,43 @@ uint32_t interpolated_frame_count() noexcept {
   return s_activeInterpolationSamples.load(std::memory_order_acquire);
 }
 
+// Motion vectors for draws whose uniforms are uploaded before the frame seals (a mid-frame split: the game reads
+// the EFB back, or staging ran full). The prefix renders now, so its draws are paired now, with a simpler rule than
+// the seal's global matcher: pair_motion_draw for every draw. One-matrix draws take the nearest unclaimed translation
+// (of the exact group and the stable one, when there is an exact match), skinned draws the same occurrence (else the
+// first unclaimed) with a palette, from the exact group first, then the stable one.
+void resolve_pending_motion_uniforms_early() noexcept {
+  if (s_pendingMotionUniforms.empty()) {
+    return;
+  }
+  estimate_motion_camera_deltas();
+  for (const auto& task : s_pendingMotionUniforms) {
+    if (task.currentTransformIndex >= s_currentFrameTransforms.size()) {
+      continue;
+    }
+    const auto& entry = s_currentFrameTransforms[task.currentTransformIndex];
+    if (task.indexedMatrices != (entry.transform.indexedMatrices != nullptr)) {
+      continue;
+    }
+    if (motion_camera_cut(entry.transform.viewportIdentity)) {
+      continue; // a camera cut: this frame's matrices, no motion
+    }
+    const size_t partner = pair_motion_draw(task.currentTransformIndex, task.indexedMatrices);
+    if (partner != SIZE_MAX) {
+      write_motion_partner(task, entry.transform, s_previousFrameTransforms[partner].transform);
+    } else {
+      write_motion_still(task, entry.transform);
+    }
+  }
+}
+
 void drop_pending_frame_interpolation_uniforms() noexcept {
   // Pending tasks hold raw pointers into the mapped uniform staging range, so anything
-  // that unmaps or rotates that buffer first has to drop the tasks.
+  // that unmaps or rotates that buffer first has to drop the tasks. Motion vectors are paired first.
   s_pendingUniformInterpolations.clear();
+  resolve_pending_motion_uniforms_early();
+  s_pendingMotionUniforms.clear();
+  drop_motion_draws();
 }
 
 void mark_frame_interpolation_replay_unsafe() noexcept {
@@ -1445,6 +2026,122 @@ void extend_interpolation_draw(uint16_t usedPnMtxMask) noexcept {
                     xxh3_hash_s(&g_gxState.pnMtx[slot].nrm, sizeof(Mat3x4<float>)));
   }
   snapshot.usedMatrixMask |= addedSlots;
+}
+
+// ----- Motion vectors, vertex history. The game animates characters on the CPU: it rewrites a model's POS array
+// every frame and keeps its indices, so the matrices alone show only where the whole model moved, not its limbs. A draw
+// whose positions changed since last frame keeps a copy of them; next frame the matching draw (same mesh: stable
+// identity, the nearest copy of it, same array size) gets that copy uploaded beside its own, and its shader
+// reads each vertex's previous position from it.
+constexpr uint32_t kMaximumPosHistoryBytes = 1u << 20;
+
+// ----- Motion vectors, HUD (see note_motion_draw).
+std::vector<uint8_t*> s_motionDraws; // this frame's (still mapped) motion blocks, in draw order
+size_t s_motionHudStart = SIZE_MAX;  // index into s_motionDraws of the first HUD draw
+bool s_motionFrameSaw3D = false;
+
+void note_motion_draw(uint8_t* motionPrevData, bool perspective, bool depthClear) noexcept {
+  if (depthClear && s_motionFrameSaw3D) {
+    s_motionHudStart = s_motionDraws.size() + 1; // what comes after this clear
+  }
+  s_motionFrameSaw3D = s_motionFrameSaw3D || perspective;
+  s_motionDraws.push_back(motionPrevData);
+}
+
+// At seal (the blocks are still mapped): flag the HUD's draws.
+void flag_motion_hud() noexcept {
+  for (size_t i = s_motionHudStart; i < s_motionDraws.size(); ++i) {
+    uint32_t flags;
+    std::memcpy(&flags, s_motionDraws[i] + kMotionPrevPosOffset + sizeof(uint32_t), sizeof(flags));
+    flags |= 2u;
+    std::memcpy(s_motionDraws[i] + kMotionPrevPosOffset + sizeof(uint32_t), &flags, sizeof(flags));
+  }
+}
+
+// A mid-frame split uploads the blocks recorded so far: flag the HUD's among them now (still mapped), then forget
+// them. If the HUD has started, everything after the split belongs to it as well.
+void drop_motion_draws() noexcept {
+  flag_motion_hud();
+  if (s_motionHudStart != SIZE_MAX) {
+    s_motionHudStart = 0;
+  }
+  s_motionDraws.clear();
+}
+
+// A new frame: nothing recorded, no HUD yet.
+void reset_motion_draws() noexcept {
+  s_motionDraws.clear();
+  s_motionHudStart = SIZE_MAX;
+  s_motionFrameSaw3D = false;
+}
+
+uint32_t motion_vertex_history_bytes(uint32_t posArraySize) noexcept {
+  return gfx::motion_vectors_active() && posArraySize <= kMaximumPosHistoryBytes ? posArraySize : 0;
+}
+
+// A draw's own draw last frame among the copies of its mesh. Its place among them says nothing once a copy comes or goes:
+// when one of the i004 ghosts left the view, the next ghost took its place and read its pose as its own previous shape,
+// 15 pixels of motion on a frame where it moved 0.4. So a one-matrix draw takes the copy nearest to where it would be if
+// it stood still, with last frame's estimate of the camera (this frame's comes at seal, and a camera turns smoothly).
+// Copies at one spot keep their order, and a skinned draw has no one position to compare.
+size_t motion_history_partner(const std::vector<size_t>& candidates, size_t ordinal,
+                              const FrameTransformSnapshot& current) noexcept {
+  size_t best = ordinal < candidates.size() ? candidates[ordinal] : SIZE_MAX;
+  if (current.indexedMatrices || candidates.size() < 2) {
+    return best;
+  }
+  const Mat3x4<float> predicted = predicted_still(current);
+  float bestDistance = best != SIZE_MAX ? translation_delta_squared(s_previousFrameTransforms[best].transform.position, predicted)
+                                        : std::numeric_limits<float>::max();
+  for (const size_t index : candidates) {
+    const auto& previous = s_previousFrameTransforms[index].transform;
+    if (previous.indexedMatrices) {
+      continue;
+    }
+    if (const float distance = translation_delta_squared(previous.position, predicted); distance < bestDistance) {
+      bestDistance = distance;
+      best = index;
+    }
+  }
+  return best;
+}
+
+void record_motion_vertex_history(size_t currentTransformIndex, const FrameInterpolationDrawIdentity& identity,
+                                  HashType stableIdentity, const InterpolatedUniformLayout& layout) {
+  if (layout.posArraySize == 0 || layout.posArraySize > kMaximumPosHistoryBytes) {
+    return;
+  }
+  const auto stablePrevious = s_previousStableTransformIndices.find(stableIdentity);
+  if (stablePrevious == s_previousStableTransformIndices.end() || stablePrevious->second.empty()) {
+    return; // a mesh last frame did not draw
+  }
+  // This draw's occurrence among this frame's draws of the same mesh (it was just added), and its own draw last frame.
+  const auto& currentGroup = s_currentStableTransformIndices[stableIdentity];
+  const size_t ordinal = currentGroup.empty() ? 0 : currentGroup.size() - 1;
+  const auto& candidates = stablePrevious->second;
+  const size_t own = motion_history_partner(candidates, ordinal, s_currentFrameTransforms[currentTransformIndex].transform);
+  // Its positions are unchanged when its own draw last frame had the same exact identity. Any draw with that identity
+  // is not enough: copies of a mesh the game animates on the CPU, out of step, match each other's last-frame shape
+  // (the f001 fish paste), and the moving paste got no motion.
+  const auto exactPrevious = s_previousTransformIndices.find(identity.combined);
+  if (exactPrevious != s_previousTransformIndices.end() && !exactPrevious->second.empty() &&
+      (own == SIZE_MAX ||
+       std::find(exactPrevious->second.begin(), exactPrevious->second.end(), own) != exactPrevious->second.end())) {
+    return; // unchanged positions: no history needed
+  }
+  if (own != SIZE_MAX) {
+    const auto& previous = s_previousFrameTransforms[own];
+    if (previous.posHistory && previous.posHistory->size() == layout.posArraySize) {
+      const auto range = gfx::push_storage(previous.posHistory->data(), previous.posHistory->size());
+      const std::array<uint32_t, 2> prevPos{static_cast<uint32_t>(range.offset), 1u};
+      std::memcpy(layout.motionPrevData + kMotionPrevPosOffset, prevPos.data(), sizeof(prevPos));
+      // The frame's own image; the in-between images' copies write their own share.
+      const float wholeFrame = 1.f;
+      std::memcpy(layout.motionPrevData + kMotionImageShareOffset, &wholeFrame, sizeof(wholeFrame));
+    }
+  }
+  s_currentFrameTransforms[currentTransformIndex].posHistory =
+      std::make_shared<const std::vector<uint8_t>>(layout.posArrayData, layout.posArrayData + layout.posArraySize);
 }
 
 std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
@@ -1494,6 +2191,18 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
   const HashType stableIdentity = stable_identity(identity);
   s_currentStableTransformIndices[stableIdentity].push_back(currentTransformIndex);
 
+  if (uniformLayout.motionPrevData != nullptr && uniformLayout.posArrayData != nullptr) {
+    record_motion_vertex_history(currentTransformIndex, identity, stableIdentity, uniformLayout);
+  }
+  if (uniformLayout.motionPrevData != nullptr) {
+    s_pendingMotionUniforms.push_back({
+        .currentTransformIndex = currentTransformIndex,
+        .data = uniformLayout.motionPrevData,
+        .currentMatrix = uniformLayout.currentMatrix,
+        .indexedMatrices = uniformLayout.indexedMatrices,
+    });
+  }
+
   std::array<gfx::Range, MaxInterpolatedFrames> interpolatedRanges{};
   ++s_perspectiveCandidates;
   const auto exactPrevious = s_previousTransformIndices.find(identity.combined);
@@ -1527,6 +2236,9 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
           .numerator = sample + 1,
           .denominator = sampleCount + 1,
           .indexedMatrices = uniformLayout.indexedMatrices,
+          .motionPrevOffset = uniformLayout.motionPrevData != nullptr
+                                  ? static_cast<size_t>(uniformLayout.motionPrevData - uniformLayout.sourceUniformData)
+                                  : SIZE_MAX,
       });
       interpolatedRanges[sample] = interpolatedRange;
     }

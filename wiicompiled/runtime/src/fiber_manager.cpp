@@ -5,6 +5,7 @@
 #include "host_context.h"
 #include "runtime_log.h"
 #include "system_bridge.h"
+#include <aurora/window_owner.hpp>
 
 // Defined in hle/os/os_sleep.cpp; the sleep-timer table is file-local there.
 
@@ -24,6 +25,7 @@ void* GuestFiberManager::s_schedulerFiber = nullptr;
 uint32_t GuestFiberManager::s_currentGuestThread = 0;
 bool GuestFiberManager::s_initialized = false;
 thread_local CpuContext* GuestFiberManager::s_cpuContext = nullptr;
+thread_local std::exception_ptr GuestFiberManager::s_ownerException;
 
 void GuestFiberManager::PurgePendingFibers() {
     std::vector<void*> toDelete;
@@ -47,10 +49,11 @@ std::atomic<uint32_t> g_viRetracePendingCount{0};
 namespace {
 constexpr uint32_t kOSCurrentContextAddr = 0x800000d4u;
 constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;  // OSGetCurrentThread reads this
-constexpr uint32_t kThreadQueueArrayAddr = 0x8025B078u;          // RunQueue (NSMBW)
-constexpr uint32_t kSchedulerPendingFlagAddr = 0x80279c68u;      // RunQueueBits (NSMBW)
-constexpr uint32_t kSchedulerReschedCounterAddr = 0x80279c6cu;   // RunQueueHint (NSMBW)
-constexpr uint32_t kSchedulerIdleFlagAddr = 0x80279c70u;         // Reschedule (NSMBW)
+constexpr uint32_t kThreadQueueArrayAddr = 0x8025B078u;          // RunQueue (Unmasked)
+constexpr uint32_t kSchedulerPendingFlagAddr = 0x80279c68u;      // RunQueueBits (Unmasked)
+constexpr uint32_t kSchedulerReschedCounterAddr = 0x80279c6cu;   // RunQueueHint (Unmasked)
+constexpr uint32_t kSchedulerIdleFlagAddr = 0x80279c70u;         // Reschedule (Unmasked)
+constexpr uint32_t kViRetraceQueueHeadAddr = 0x80279D5Cu;        // retraceQueue (Unmasked), for DumpGuestThreads
 
 // OSThread structure offsets
 constexpr uint32_t kThreadStateOffset = 0x2C8u;
@@ -196,6 +199,7 @@ void GuestFiberManager::Initialize() {
     }
     
     s_currentGuestThread = 0;
+    s_ownerException = nullptr;
     s_initialized = true;
 }
 
@@ -408,7 +412,7 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
         // FPSCR travels with the guest-thread context, and its NI bit is
         // modeled through the per-host-thread MXCSR; every context restore
         // must re-mirror it.
-        MkwApplyHostNiMode(cpu->fpscr);
+        RecompApplyHostNiMode(cpu->fpscr);
     }
 
     // Switch to the target fiber (the target fiber will load its own context)
@@ -439,7 +443,7 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
             if (it != s_fibers.end()) {
                 if (cpu) {
                     *cpu = it->second.cpuContext;
-                    MkwApplyHostNiMode(cpu->fpscr);
+                    RecompApplyHostNiMode(cpu->fpscr);
                 }
                 it->second.state = ThreadState::RUNNING;
             }
@@ -447,10 +451,15 @@ void GuestFiberManager::SwitchToThread(uint32_t guestThreadAddr, CpuContext* cpu
         } else {
             if (cpu && haveCallerContext) {
                 *cpu = callerContext;
-                MkwApplyHostNiMode(cpu->fpscr);
+                RecompApplyHostNiMode(cpu->fpscr);
             }
             s_currentGuestThread = 0;
         }
+    }
+    if (s_ownerException) {
+        const auto error = s_ownerException;
+        s_ownerException = nullptr;
+        std::rethrow_exception(error);
     }
 }
 
@@ -477,15 +486,15 @@ void GuestFiberManager::DumpGuestThreads(std::ostream& os) {
     }
     os << "[fiber] " << s_fibers.size() << " guest thread(s); current 0x" << std::hex << std::uppercase
        << s_currentGuestThread << std::dec << std::nouppercase << std::endl;
-    // The guest OS's own view (SPM addresses): which threads it can run and who sleeps on the VI
+    // The guest OS's own view: which threads it can run and who sleeps on the VI
     // retrace queue. A thread the host calls READY but the OS never queues is waiting on something.
     const auto word = [](uint32_t addr) {
         uint32_t value = 0;
         return Memory::TryRead32(addr, value) ? value : 0xDEADDEADu;
     };
-    os << "[fiber] OS: RunQueueBits=0x" << std::hex << std::uppercase << word(0x8056DBB0u)
-       << " Reschedule=0x" << word(0x8056DBA8u) << " retraceQueue head=0x" << word(0x8056DD88u)
-       << " tail=0x" << word(0x8056DD8Cu) << " current=0x" << word(kOSCurrentContextAddr)
+    os << "[fiber] OS: RunQueueBits=0x" << std::hex << std::uppercase << word(kSchedulerPendingFlagAddr)
+       << " Reschedule=0x" << word(kSchedulerIdleFlagAddr) << " retraceQueue head=0x" << word(kViRetraceQueueHeadAddr)
+       << " tail=0x" << word(kViRetraceQueueHeadAddr + 4u) << " current=0x" << word(kOSCurrentContextAddr)
        << " running=0x" << word(kOSRunningContextAddr) << std::dec << std::nouppercase << std::endl;
     for (const auto& [thread, fiber] : s_fibers) {
         os << "[fiber] thread 0x" << std::hex << std::uppercase << thread << " entry 0x" << fiber.entryPoint
@@ -614,26 +623,36 @@ void GuestFiberManager::FiberProc(void* param)
     cpu->pc = entryPoint;
     cpu->srr0 = entryPoint;
     
-    // Create a CpuContextScope for this fiber
-    CpuContextScope scope(cpu);
-    
-    // SPM has no NSMBW EGG::Thread::start entry at 0x802BA860.
-
-
-    // The deferral loop above yields to the scheduler and therefore can resume
-    // with registers from a different guest fiber in the shared CpuContext.
-    cpu->gpr[3] = entryArg;
-    cpu->pc = entryPoint;
-    cpu->srr0 = entryPoint;
-
-    
-    // Call the translated thread entry function
-    const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(entryPoint);
-    if (info) {
-        InvokeIndirectCpu(entryPoint, cpu);
-    } else {
-        RT_LOG(RT_TAG_OS) << "Thread entry 0x" << std::hex << entryPoint
-                  << " not found in registry!" << std::dec << std::endl;
+    std::exception_ptr ownerException;
+    {
+        CpuContextScope scope(cpu);
+        cpu->gpr[3] = entryArg;
+        cpu->pc = entryPoint;
+        cpu->srr0 = entryPoint;
+        const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(entryPoint);
+        try {
+            if (info) {
+                InvokeIndirectCpu(entryPoint, cpu);
+            } else {
+                RT_LOG(RT_TAG_OS) << "Thread entry 0x" << std::hex << entryPoint
+                          << " not found in registry!" << std::dec << std::endl;
+            }
+        } catch (...) {
+            if (!aurora::window_owner::enabled()) throw;
+            ownerException = std::current_exception();
+        }
+    }
+    if (ownerException) {
+        {
+            std::lock_guard lock(s_mutex);
+            fiber->terminated = true;
+            fiber->state = ThreadState::MORIBUND;
+            s_currentGuestThread = 0;
+        }
+        s_ownerException = ownerException;
+        // Teardown must unwind on the scheduler stack, never delete the active guest fiber.
+        HostContext::Switch(s_schedulerFiber);
+        std::terminate();
     }
     
     // Thread entry functions normally return into OSExitThread on hardware.

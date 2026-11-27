@@ -224,12 +224,18 @@ private:
 };
 } // namespace aurora
 
+namespace aurora::gx {
+struct DrawData;
+} // namespace aurora::gx
+
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = false;
 inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
 inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
 inline constexpr uint64_t IndexBufferSize = 2097152;     // 2mb
-inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
+// Every indexed draw uploads its vertex-array span again, so the hubs need more than 8 MB a frame (h002 more than 16).
+// At 8 MB each frame split mid-way, which disabled interpolation replay for it (#131).
+inline constexpr uint64_t StorageBufferSize = 33554432;  // 32mb
 inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 
 extern AuroraStats g_stats;
@@ -326,7 +332,7 @@ void after_submit() noexcept;
 void map_staging_buffer();
 // `persistentCopy` marks resolves whose destination outlives the frame with no re-issue path, so
 // the pass waits for its pipelines instead of dropping draws that would be baked in permanently.
-// NSMBW: after `source` (a resolve target) is resolved this frame, copy it, scaled to width x height,
+// After `source` (a resolve target) is resolved this frame, copy it, scaled to width x height,
 // into `dst` at (x, y). False when it can't (no such resolve, or dst isn't RGBA8).
 bool add_resolve_patch(const TextureHandle& source, TextureHandle dst, uint32_t x, uint32_t y, uint32_t width,
                        uint32_t height);
@@ -341,6 +347,24 @@ void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
 bool is_offscreen() noexcept;
 uint32_t get_sample_count() noexcept;
+// Motion vectors (for motion blur and the debug view): every render pass gets three more
+// targets: at location 1 (RG16F) where each pixel's surface was last frame minus where it is now, in render-target
+// pixels; at 2 (R32F) that surface's depth; at 3 (R8) the HUD mark. Written by GX draws that own their pixels (see
+// gx.cpp motion_owner); zero motion where nothing moved.
+// Requested from any thread; each new frame latches the request, so a frame is recorded and encoded with one setting.
+void request_motion_vectors(bool requested) noexcept;
+// What the next frame will latch.
+bool motion_vectors_wanted() noexcept;
+// This frame's setting (the recording thread's view).
+bool motion_vectors_active() noexcept;
+struct MotionTargets {
+  webgpu::TextureWithSampler motion;
+  webgpu::TextureWithSampler depth;
+  webgpu::TextureWithSampler mark;
+};
+class SealedFrame;
+// The EFB motion targets a sealed frame was drawn with; null if it had none.
+const MotionTargets* sealed_motion_targets(const SealedFrame& frame) noexcept;
 void clear_caches() noexcept;
 
 namespace tex_palette_conv {
@@ -385,6 +409,12 @@ template <typename DrawData>
 void push_draw_command(DrawData data);
 template <typename DrawData>
 DrawData* get_last_draw_command();
+enum class DeferredDrawKind : uint8_t { SurfaceLayer, Translucent };
+// While the world is drawn in order (the scene stage is in use): surface layers, then translucent world draws, after
+// the solid scene. Each keeps its viewport/scissor. A clear, overlay or render-pass boundary ends the deferred scene.
+void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind kind);
+void flush_deferred_draws();
+bool has_pending_translucent_draws() noexcept;
 
 template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);

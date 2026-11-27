@@ -1132,8 +1132,11 @@ static void ApplyAuroraVtxDesc() {
         // GXGetVtxDesc only decodes GX_VA_PNMTXIDX..GX_VA_TEX7; the XF array
         // pseudo-attributes above GX_VA_TEX7 have no CP descriptor bits, so
         // probing them would always report GX_NONE and republish a no-op.
-        if (!needsPublish && !IsMatrixIndexAttr(gxAttr) && gxAttr <= GX_VA_TEX7 &&
-            (type == GX_INDEX8 || type == GX_INDEX16)) {
+        // Every attribute is checked, not just indexed ones: the game's own VCD
+        // writes reach aurora's decoder without touching its API shadow, and the
+        // next dirty flush re-sends the whole shadow. A stale GX_DIRECT left there
+        // by an earlier draw widened the vertex and scrambled the mesh (FrightWorks-no100f #2).
+        if (!needsPublish && gxAttr <= GX_VA_TEX7) {
             needsPublish = !AuroraVtxDescMatchesLive(gxAttr, type);
         }
         if (needsPublish) {
@@ -1288,7 +1291,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t, 
 
 } // namespace
 
-extern "C" unsigned g_spmAudit[8];  // aurora command_processor (SPM diagnostics)
+extern "C" unsigned g_gxAudit[8];  // aurora command_processor (SPM diagnostics)
 extern "C" int g_spmSweepDump;
 extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
     GxGuestWrite::NotifyWrite(addr, size);
@@ -1347,7 +1350,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                           char b[160]; std::snprintf(b, sizeof b, " r%d %s f0 %08X f4 %08X bm %u col %08X", r, nm.c_str(), Memory::Read32(o), Memory::Read32(o + 4), Memory::Read8(o + 8), Memory::Read32(o + 0x10));
                           obj = b; break;
                       }
-                      RT_LOGF(RT_TAG_GX, "[spmcall] draw %u id %u addr %08X%s\n", g_spmAudit[0], (uint32_t(list[8]) << 24) | (uint32_t(list[9]) << 16) | (uint32_t(list[10]) << 8) | list[11], listAddr, obj.c_str());
+                      RT_LOGF(RT_TAG_GX, "[spmcall] draw %u id %u addr %08X%s\n", g_gxAudit[0], (uint32_t(list[8]) << 24) | (uint32_t(list[9]) << 16) | (uint32_t(list[10]) << 8) | list[11], listAddr, obj.c_str());
                   } }
                 g_boundTexMaps.fill(BoundTexInfo{});
                 EnsureAuroraFrameActive();

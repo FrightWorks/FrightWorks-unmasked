@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 
@@ -9,11 +11,11 @@ void InitializeRuntimeSettings() noexcept;
 // Draw the F10 settings bar before each Aurora present.
 void HandleEvents(const AuroraEvent* events) noexcept;
 void Draw() noexcept;
-bool StartupScreenVisible() noexcept;
-void NotifyStrapInputAccepted() noexcept;
-void AdvancePresentedFrame() noexcept;
 // Put host controllers back to a neutral state before the process ends.
 void ReleaseControllers() noexcept;
+// Pad 1 buttons F10 presses for the game (Start for its pause menu while F10 is open), ORed in by PADRead after the
+// input block. Counts the read: call once per PADRead. Game thread.
+uint16_t PressedButtons() noexcept;
 // FPS counter on or off (the Android menu sets it through JNI); saved to Config.toml.
 void SetShowFps(bool show) noexcept;
 bool ShowFps() noexcept;

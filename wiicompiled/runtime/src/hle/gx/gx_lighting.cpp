@@ -1,7 +1,7 @@
 // gx_lighting.cpp - Lighting and Channel Control
 #include "gx_internal.h"
 #include "runtime_log.h"
-extern "C" unsigned g_spmAudit[8];  // aurora command_processor (SPM diagnostics)
+extern "C" unsigned g_gxAudit[8];  // aurora command_processor (SPM diagnostics)
 extern "C" int g_spmSweepDump;
 bool SpmAuroraDlRecording();  // gx_init.cpp: material lists are recorded at map load
 
@@ -122,7 +122,7 @@ extern "C" void GX__SetChanCtrl_80170570(uint32_t ch, uint32_t en, uint32_t as, 
                   if (s.empty()) { uint32_t q = 0; if (Memory::TryRead32(p, q) && Memory::Contains(q, 8)) { uint32_t q2 = 0; if (Memory::TryRead32(q, q2)) s = readStr(q2); } }  // struct -> name ptr
                   if (!s.empty()) names += " r" + std::to_string(r) + "=" + s;
               }
-              RT_LOGF(RT_TAG_GX, "[spmmat] draw %u%s\n", g_spmAudit[0], names.c_str());
+              RT_LOGF(RT_TAG_GX, "[spmmat] draw %u%s\n", g_gxAudit[0], names.c_str());
           }
       } }
     GXSetChanCtrl((GXChannelID)ch, en!=0, (GXColorSrc)as, (GXColorSrc)ms, lm, (GXDiffuseFn)df, (GXAttnFn)af);

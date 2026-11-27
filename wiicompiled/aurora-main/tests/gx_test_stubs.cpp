@@ -2,6 +2,7 @@
 // full renderer, so the test binary links without the WebGPU runtime.
 
 #include "gx/gx.hpp"
+#include "gfx/bloom.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/common.hpp"
 #include "gfx/depth_peek.hpp"
@@ -39,9 +40,9 @@ std::deque<std::vector<uint8_t>> s_uniformAllocations;
 // --- aurora::g_config ---
 namespace aurora {
 AuroraConfig g_config{};
-void wait_for_frame_worker() noexcept {}
-std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept { return {}; }
-bool wait_for_frame_worker_for(std::chrono::microseconds) noexcept { return true; }
+void wait_for_frame_worker() {}
+std::chrono::nanoseconds wait_for_frame_worker_sealed() { return {}; }
+bool wait_for_frame_worker_for(std::chrono::microseconds) { return true; }
 std::recursive_mutex& renderer_gpu_mutex() noexcept {
   static std::recursive_mutex mutex;
   return mutex;
@@ -60,6 +61,7 @@ void Module::show_fatal_dialog(const char*, std::string_view) noexcept {}
 
 namespace aurora::window {
 void set_present_surface_fill(bool) {}
+void set_fixed_aspect(float) {}
 } // namespace aurora::window
 
 // --- fmt::formatter<AuroraLogLevel> ---
@@ -67,6 +69,10 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
     -> format_context::iterator {
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
+
+namespace aurora {
+std::atomic<uint64_t> g_presentScheduleBaseNanos{0};
+} // namespace aurora
 
 // --- GPU buffers (default-constructed, not used in tests) ---
 namespace aurora::gfx {
@@ -77,7 +83,20 @@ wgpu::Buffer g_indexBuffer;
 wgpu::Buffer g_storageBuffer;
 uint32_t g_drawCallCount = 0;
 uint32_t g_mergedDrawCallCount = 0;
+bool motion_vectors_active() noexcept { return false; }
 } // namespace aurora::gfx
+
+namespace aurora::gfx::scene_stage {
+bool wanted() noexcept { return false; }
+void note_camera(const Mat4x4<float>&, const webgpu::Viewport&) noexcept {}
+void note_solid_surface(HashType) noexcept {}
+bool is_solid_surface(HashType) noexcept { return false; }
+} // namespace aurora::gfx::scene_stage
+
+namespace aurora::gfx::bloom {
+bool wanted() noexcept { return false; }
+bool is_light_texture(TextureRef&) noexcept { return false; }
+} // namespace aurora::gfx::bloom
 
 namespace aurora::webgpu {
 GraphicsConfig g_graphicsConfig{};
@@ -91,6 +110,7 @@ void notify_copy_texture_created() noexcept {}
 
 namespace aurora::vi {
 Vec2<uint32_t> configured_fb_size() noexcept { return s_logicalFbSize; }
+Vec2<uint32_t> visible_fb_size() noexcept { return s_logicalFbSize; }
 void configure(const GXRenderModeObj*) noexcept {}
 } // namespace aurora::vi
 
@@ -100,8 +120,17 @@ std::vector<TextureUpload> g_textureUploads;
 } // namespace aurora::gfx
 
 namespace aurora::gfx::efb_ram {
-void schedule(void*, uint32_t, uint32_t, GXTexFmt, TextureHandle) noexcept {}
+void schedule(void*, uint32_t, uint32_t, GXTexFmt, TextureHandle, uint32_t) noexcept {}
 } // namespace aurora::gfx::efb_ram
+
+// --- Copies patching textures, cut-outs (gx.cpp, common.cpp) ---
+namespace aurora::gx {
+GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_&) noexcept { return nullptr; }
+std::vector<PatchTarget> find_patch_targets(const void*) { return {}; }
+} // namespace aurora::gx
+namespace aurora::gfx {
+bool add_resolve_patch(const TextureHandle&, TextureHandle, uint32_t, uint32_t, uint32_t, uint32_t) { return false; }
+} // namespace aurora::gfx
 
 // --- get_texture ---
 namespace aurora::gx {
@@ -136,7 +165,7 @@ void evict_copy_texture(const void* dest) noexcept {
     }
   }
 }
-void set_display_copy_present_source() noexcept {}
+void set_display_copy_present_source(std::array<float, 4>) noexcept {}
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return s_logicalFbSize; }
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
@@ -367,6 +396,14 @@ void push_draw_command<gx::DrawData>(gx::DrawData data) {
     s_lastGxDraw = std::move(data);
   }
 }
+// A deferred draw (translucent tail, surface layer) is recorded like any other.
+void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind) {
+  if (s_trackDrawCommands) {
+    s_lastGxDraw = data;
+  }
+}
+void flush_deferred_draws() {}
+bool has_pending_translucent_draws() noexcept { return false; }
 template <>
 gx::DrawData* get_last_draw_command() {
   return s_trackDrawCommands && s_lastGxDraw.has_value() ? &*s_lastGxDraw : nullptr;

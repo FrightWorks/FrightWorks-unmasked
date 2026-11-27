@@ -57,8 +57,8 @@ inline std::filesystem::path ResolveConfiguredPath(const std::string& value) {
     return RuntimeConfigFile::ResolveRelativeToConfig(value);
 }
 
-// NSMBW: which game folder this is, as a fingerprint of its files (relative path and size of each),
-// so a mod of the game (New Super Mario Bros. Wii 2 - The Next Levels...) is told apart from the
+// Which game folder this is, as a fingerprint of its files (relative path and size of each),
+// so a mod of the game is told apart from the
 // original. Empty when there is no readable game folder.
 inline std::string GameSaveKey() {
     const std::filesystem::path root = RuntimeConfigFile::ResolvedDvdRoot();
@@ -118,7 +118,7 @@ inline std::filesystem::path ManagedNandRootPath() {
         if (ownerKey == key) {
             return shared;
         }
-        const std::filesystem::path own = RuntimeConfigFile::ApplicationDataDirectory() / "Saves" / key / "NAND";
+        const std::filesystem::path own = RuntimeConfigFile::SavesDirectory() / key / "NAND";
         RT_LOGF(RT_TAG_NAND, "this game's saves: %s\n", RuntimeConfigFile::PathToUtf8(own).c_str());
         return own;
     }();

@@ -3,6 +3,7 @@
 //  - ARAM, the 16 MB audio/auxiliary RAM. The engine uses it as virtual memory (engine.ini GCVMSARAMSize) and
 //    for streamed audio. Here it is a host buffer; AR DMA and ARQ requests copy at once and queue their
 //    completion callback on the DVD drain, like the AR interrupt would.
+#include "guest_interrupt_context.h"
 #include "hle_stubs.h"
 #include "memory.h"
 #include "runtime_log.h"
@@ -12,6 +13,7 @@
 #include <vector>
 
 void QueueGuestCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4);  // hle/storage/dvd.cpp
+bool DvdProcessPendingCallbacks(CpuContext* cpu);                           // hle/storage/dvd.cpp
 extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);   // hle/gx/gx_objects.cpp
 
 #include "guest_profiler.h"
@@ -105,6 +107,18 @@ extern "C" void ARQPostRequest_Gc(uint32_t request, uint32_t owner, uint32_t typ
     if (type == 0) AramCopy(0, source, dest, length);
     else AramCopy(1, dest, source, length);
     QueueGuestCallback(callback, request, 0);
+    // AMPushBuffered (loading sound banks) posts and then spins until this callback sets its flag: `while (!done) {}`.
+    // Left on the queue the callback ran only at the next disc read, after that loop; translated, the loop is an empty
+    // infinite loop, which the Windows build happened to drop and the Linux build kept, hanging on the loading screen.
+    // So complete that one now, on a private register copy like other interrupts. Only that one: the stream refills
+    // (SOUND_ProcessStreams) read their staging buffer after posting, and SOUND_UpdateStreamCB starts the next disc
+    // read into it, which here lands at once - run early, the voice got the next chunk's ADPCM header and streamed
+    // music and voices stuttered.
+    constexpr uint32_t kAmPushBufferedDone = 0x80128358u;
+    if (callback == kAmPushBufferedDone) {
+        GuestInterruptCallbackContext interrupt;
+        DvdProcessPendingCallbacks(interrupt.get());
+    }
 }
 PPC_NATIVE_OVERRIDE_VOID(8015B264, ARQPostRequest_Gc,
     (uint32_t r, uint32_t o, uint32_t t, uint32_t p, uint32_t s, uint32_t d, uint32_t l, uint32_t c),

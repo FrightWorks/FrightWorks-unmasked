@@ -1,13 +1,17 @@
 add_library(aurora_gx STATIC
+        lib/gfx/bloom.cpp
         lib/gfx/clear.cpp
         lib/gfx/common.cpp
         lib/gfx/depth_peek.cpp
         lib/gfx/efb_ram_copy.cpp
         lib/gfx/efb_ram_encoder.cpp
+        lib/gfx/motion_effects.cpp
+        lib/gfx/scene_stage.cpp
         lib/gfx/pipeline_cache.cpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp
+        lib/gfx/sharp_font.cpp
         lib/gfx/texture.cpp
         lib/gfx/texture_convert.cpp
         lib/gfx/texture_replacement.cpp

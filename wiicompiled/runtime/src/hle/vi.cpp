@@ -10,12 +10,12 @@
 #include "guest_interrupt_context.h"
 #include "ppc_runtime.h"
 #include "aurora_events.h"
+#include "no100f_game_state.h"
 #include "settings_overlay.h"
 #include "fiber_manager.h"
 #include "platform/host_platform.h"
 #include "runtime_log.h"
 #include "guest_profiler.h"
-#include "spm_map_sweep.h"
 
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
@@ -398,9 +398,82 @@ static std::atomic<bool> s_presentSequenceActive{false};
 // watchdog that dumps every guest thread's state if none arrived after 12 s and again after 30 s, so
 // a boot that stalls in a wait loop shows where each thread is parked.
 static std::atomic<uint32_t> s_presentedXfbFrames{0};
-extern "C" { extern int g_spmDrawDump; extern int g_spmCullOff; extern int g_spmSweepDump; extern unsigned g_spmDrawIdx; extern unsigned g_spmDrawLimit; }  // aurora command_processor (SPM bring-up diagnostics)
+extern "C" { extern int g_gxDrawDump; extern int g_gxCullOff; extern unsigned g_gxDrawIdx; extern unsigned g_gxDrawLimit; }
+extern "C" { int g_spmSweepDump = 0; }  // was set by the SPM map sweep (removed); gx_dl.cpp and gx_lighting.cpp still read it  // aurora command_processor (SPM bring-up diagnostics)
 static uint32_t SpmPresentedFramesLocal() { return s_presentedXfbFrames.load(std::memory_order_relaxed); }
 static uint32_t (*const g_spmFramesFn)() = &SpmPresentedFramesLocal;
+
+// From the first frame on, on its own thread: 10 s with no new frame while the window isn't paused (minimized,
+// or in the background with pause-on-focus-lost) is logged once with where the game was and its guest threads, and
+// the recovery too. A player's log from a freeze then ends with where it stopped instead of just stopping
+// (FrightWorks-no100f #228). Logging only: the game keeps waiting.
+[[noreturn]] void WatchForHangs() {
+    using namespace std::chrono;
+    constexpr auto kHangAfter = seconds(10);
+    uint32_t lastFrames = s_presentedXfbFrames.load(std::memory_order_relaxed);
+    auto lastProgress = steady_clock::now();
+    bool reported = false;
+    for (;;) {
+        std::this_thread::sleep_for(milliseconds(500));
+        const auto now = steady_clock::now();
+        const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
+        if (frames != lastFrames || g_auroraWindowPaused.load(std::memory_order_relaxed)) {
+            if (reported) {
+                RT_LOGF(RT_TAG_VI, "[hang] frames again after %.1f s (frame %u)\n",
+                        duration<double>(now - lastProgress).count(), frames);
+                reported = false;
+            }
+            lastFrames = frames;
+            lastProgress = now;
+            continue;
+        }
+        if (reported || frames == 0 || now - lastProgress < kHangAfter) {
+            continue;
+        }
+        reported = true;
+        // The game's mode, state and movie, where no100f_game_state knows this game's addresses (not yet for
+        // Scooby-Doo! Unmasked: kAddressesMapped is false and the line leaves them out).
+        uint32_t mode = 0, state = 0, movie = 0;
+        std::string where;
+        if (no100f_game_state::kAddressesMapped && Memory::TryRead32(no100f_game_state::kModeAddress, mode) &&
+            Memory::TryRead32(no100f_game_state::kStateAddress, state)) {
+            where += ": game mode " + std::to_string(mode) + " state " + std::to_string(state);
+        }
+        if (no100f_game_state::kAddressesMapped && Memory::TryRead32(no100f_game_state::kMovieAddress, movie)) {
+            where += std::string(", movie ") + (movie != 0 ? no100f_game_state::LastMovieName() : "none");
+        }
+        RT_LOGF(RT_TAG_VI, "[hang] no new frame for %lld s (last frame %u)%s; guest threads:\n",
+                static_cast<long long>(duration_cast<seconds>(now - lastProgress).count()), frames, where.c_str());
+        Fiber::GuestFiberManager::DumpGuestThreads(std::cerr);
+        std::fflush(stderr);
+    }
+}
+
+// Each Bink movie's start and end, so a log that ends during a movie (a crash or a hang at a skip) says which one,
+// and whether it had already closed. Needs no100f_game_state::kMovieAddress, not mapped for this game yet: until then
+// it logs nothing.
+void LogMovieChanges() {
+    static uint32_t s_movie = 0;
+    static Clock::time_point s_openedAt{};
+    static std::string s_name;
+    uint32_t movie = 0;
+    if (!no100f_game_state::kAddressesMapped || !Memory::TryRead32(no100f_game_state::kMovieAddress, movie) ||
+        movie == s_movie) {
+        return;
+    }
+    const uint32_t frame = s_presentedXfbFrames.load(std::memory_order_relaxed);
+    const auto now = Clock::now();
+    if (s_movie != 0) {
+        RT_LOGF(RT_TAG_VI, "[movie] closed %s after %.1f s (frame %u)\n", s_name.c_str(),
+                std::chrono::duration<double>(now - s_openedAt).count(), frame);
+    }
+    if (movie != 0) {
+        s_name = no100f_game_state::LastMovieName();
+        s_openedAt = now;
+        RT_LOGF(RT_TAG_VI, "[movie] playing %s (frame %u)\n", s_name.c_str(), frame);
+    }
+    s_movie = movie;
+}
 
 void StartStallWatchdogOnce() {
     static std::once_flag once;
@@ -413,6 +486,7 @@ void StartStallWatchdogOnce() {
                 std::thread([seconds] {
                     std::this_thread::sleep_for(std::chrono::seconds(seconds));
                     std::cerr << "[runtime] autoexit after " << seconds << " s" << std::endl;
+                    EndProcessTranscriptForExit("quit (autoexit.txt)");
                     std::_Exit(0);
                 }).detach();
             }
@@ -441,13 +515,14 @@ void StartStallWatchdogOnce() {
                 const bool black = g_vi.black;  // racy read; diagnostics only
                 RT_LOGF(RT_TAG_VI, "[watchdog] %d s: %u guest frame(s) presented, VI black=%d\n", seconds, frames,
                         black ? 1 : 0);
-                if (frames != 0 && !black && seconds != 30) {  // SPM bring-up: always dump at 30 s
+                if (frames != 0 && !black) {
                     continue;
                 }
                 RT_LOGF(RT_TAG_VI, "[watchdog] nothing visible yet; guest threads:\n");
                 Fiber::GuestFiberManager::DumpGuestThreads(std::cerr);
             }
         }).detach();
+        std::thread(WatchForHangs).detach();
     });
 }
 
@@ -527,7 +602,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     StartStallWatchdogOnce();
     LogGuestModulesOnce();
     LogSceneChanges();
-    SpmMapSweep::Tick(ctx, s_presentedXfbFrames.load(std::memory_order_relaxed));
+    LogMovieChanges();
 
     uint32_t preCb = 0;
     uint32_t postCb = 0;
@@ -578,7 +653,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     // Deterministic mode: this retrace starts a frame. Fingerprint guest memory as the previous
     // frame left it, then latch every channel's input for the new one before any guest code reads it.
     if (DetClock::Enabled()) {
-        DetHash::OnRetrace(retraceValue);
+        DetHash::OnRetrace(retraceValue, ctx ? ctx->gpr[1] : 0);
         FrameInput::Latch(retraceValue);
     }
 
@@ -641,11 +716,11 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
         const bool shouldSubmit = frameActive && (shouldPresentXfb || shouldPresentBlack);
 
         if (shouldSubmit) {
-            if (!isBlack || settings_overlay::StartupScreenVisible()) {
+            if (!isBlack) {
                 // Normal presentation: draw overlay on top of GX content
                 settings_overlay::Draw();
             }
-            // Outside startup, VI black remains a pure black presentation.
+            // VI black remains a pure black presentation.
             // Unpaced: this present already runs in retrace context.
             VI_HLE_PresentFrame(shouldPresentXfb, false);
         } else if (g_auroraFrameHadWork.load(std::memory_order_acquire) && !shouldPresentXfb && !isBlack) {
@@ -866,12 +941,12 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             const uint32_t pf = s_presentedXfbFrames.fetch_add(1, std::memory_order_relaxed) + 1;
             static const int32_t dumpTarget = [] { std::ifstream in("drawdump.txt"); int32_t f = -1; in >> f; return f; }();
             static const bool cullTest = std::ifstream("depth_test.txt").good();
-            g_spmDrawDump = ((dumpTarget >= 0 && pf == static_cast<uint32_t>(dumpTarget)) || g_spmSweepDump) ? 1 : 0;
+            g_gxDrawDump = ((dumpTarget >= 0 && pf == static_cast<uint32_t>(dumpTarget)) || g_spmSweepDump) ? 1 : 0;
             static const int envTest = [] { const char* e = std::getenv("SPM_CULL_TEST"); return e ? std::atoi(e) : 0; }();  // 1 = no culling, 2 = no depth test (diagnostic)
             static const unsigned drawLimit = [] { const char* e = std::getenv("SPM_DRAW_LIMIT"); return e ? static_cast<unsigned>(std::atoi(e)) : ~0u; }();
-            g_spmDrawLimit = drawLimit;
-            g_spmDrawIdx = 0;
-            g_spmCullOff = envTest ? envTest : ((cullTest && pf >= 6900u) ? 2 : 0);
+            g_gxDrawLimit = drawLimit;
+            g_gxDrawIdx = 0;
+            g_gxCullOff = envTest ? envTest : ((cullTest && pf >= 6900u) ? 2 : 0);
         }
         // SPM bring-up: with drawdump.txt present, report any guest write into the DOL's
         // read-only sections (.rodata/.sdata2) once the game has been running a while.
@@ -1053,7 +1128,6 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             times.lastPresentEnd = now;
         }
     }
-    settings_overlay::AdvancePresentedFrame();
     g_auroraFrameActive.store(false, std::memory_order_release);
     g_auroraFrameHadWork.store(false, std::memory_order_release);
     if (presentedXfb) {

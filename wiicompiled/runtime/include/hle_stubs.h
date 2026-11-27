@@ -44,6 +44,12 @@ extern "C" void OS_HLE_EndDeferredGuestCallbacks();
 // and abort). The translator regex-parses these macro names to skip that address at build time, so
 // renaming requires updating Translator.Cli/Program.cs, RuntimeNativeGuestEffectAnalyzer.cs,
 // TranslatedBuildShardEmitter.cs and RuntimeNativeFunctionAbiProvider.cs together.
+//
+// An override removes the game's function, so it has to port all of it. To change only a function's inputs or when
+// it runs, wrap it instead: REGISTER_NATIVE_FUNCTION_AS(0x<addr>, name, "name") takes the address over but keeps the
+// game's function translated as func_<addr>, which the wrapper calls (callers reach the wrapper by address). With
+// its option off, a wrapper should be a plain call of func_<addr>, so the game runs its own code. Example:
+// hle/no100f_particles.cpp. Compare a wrapper with main using tools/det-check.py (docs/testing.md, 4d).
 
 #define PPC_NATIVE_OVERRIDE(addr_hex, name, ret_type, arg_list, call_list) \
     extern "C" ret_type func_##addr_hex arg_list { return name call_list; } \

@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "hle/controller_status_contract.h"
 #include "input_bindings.h"
+#include "settings_overlay.h"
 #include "wii_remote_input.h"
 
 #include <aurora/aurora.h>
@@ -133,10 +134,14 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
             }
             SDL_free(ids);
         }
-        aurora_set_button_icon_style(style);
+        aurora_set_button_icons(style, nullptr);  // the GameCube A, B, X, Y icons of that family
     }
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);
+    if (const uint16_t pressed = settings_overlay::PressedButtons()) {  // F10 presses Start for the pause menu
+        statuses[0].err = PAD_ERR_NONE;
+        statuses[0].button |= pressed;
+    }
     if (uint16_t scripted = 0; WiiRemoteInput::ScriptedPadButtons(scripted)) {  // NSMBW_INPUT_SCRIPT drives pad 1 (tests)
         statuses[0].err = PAD_ERR_NONE;
         statuses[0].button |= scripted;
