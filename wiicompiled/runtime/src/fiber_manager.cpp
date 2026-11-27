@@ -49,10 +49,11 @@ std::atomic<uint32_t> g_viRetracePendingCount{0};
 namespace {
 constexpr uint32_t kOSCurrentContextAddr = 0x800000d4u;
 constexpr uint32_t kOSRunningContextAddr = 0x800000e4u;  // OSGetCurrentThread reads this
-constexpr uint32_t kThreadQueueArrayAddr = 0x8025B078u;          // RunQueue (NSMBW)
-constexpr uint32_t kSchedulerPendingFlagAddr = 0x80279c68u;      // RunQueueBits (NSMBW)
-constexpr uint32_t kSchedulerReschedCounterAddr = 0x80279c6cu;   // RunQueueHint (NSMBW)
-constexpr uint32_t kSchedulerIdleFlagAddr = 0x80279c70u;         // Reschedule (NSMBW)
+constexpr uint32_t kThreadQueueArrayAddr = 0x8025B078u;          // RunQueue (Unmasked)
+constexpr uint32_t kSchedulerPendingFlagAddr = 0x80279c68u;      // RunQueueBits (Unmasked)
+constexpr uint32_t kSchedulerReschedCounterAddr = 0x80279c6cu;   // RunQueueHint (Unmasked)
+constexpr uint32_t kSchedulerIdleFlagAddr = 0x80279c70u;         // Reschedule (Unmasked)
+constexpr uint32_t kViRetraceQueueHeadAddr = 0x80279D5Cu;        // retraceQueue (Unmasked), for DumpGuestThreads
 
 // OSThread structure offsets
 constexpr uint32_t kThreadStateOffset = 0x2C8u;
@@ -491,9 +492,9 @@ void GuestFiberManager::DumpGuestThreads(std::ostream& os) {
         uint32_t value = 0;
         return Memory::TryRead32(addr, value) ? value : 0xDEADDEADu;
     };
-    os << "[fiber] OS: RunQueueBits=0x" << std::hex << std::uppercase << word(0x8056DBB0u)
-       << " Reschedule=0x" << word(0x8056DBA8u) << " retraceQueue head=0x" << word(0x8056DD88u)
-       << " tail=0x" << word(0x8056DD8Cu) << " current=0x" << word(kOSCurrentContextAddr)
+    os << "[fiber] OS: RunQueueBits=0x" << std::hex << std::uppercase << word(kSchedulerPendingFlagAddr)
+       << " Reschedule=0x" << word(kSchedulerIdleFlagAddr) << " retraceQueue head=0x" << word(kViRetraceQueueHeadAddr)
+       << " tail=0x" << word(kViRetraceQueueHeadAddr + 4u) << " current=0x" << word(kOSCurrentContextAddr)
        << " running=0x" << word(kOSRunningContextAddr) << std::dec << std::nouppercase << std::endl;
     for (const auto& [thread, fiber] : s_fibers) {
         os << "[fiber] thread 0x" << std::hex << std::uppercase << thread << " entry 0x" << fiber.entryPoint

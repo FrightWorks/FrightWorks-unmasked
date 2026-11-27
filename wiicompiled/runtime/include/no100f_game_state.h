@@ -8,10 +8,14 @@
 #include <utility>
 
 // Scooby-Doo! Unmasked (G5DE78): where the game keeps what it is doing, for overlays that depend on it. The interface
-// is FrightWorks-no100f's (shared overlay code reads it); this game's addresses are not mapped yet. Address 0 is outside
-// guest RAM, so Memory::TryRead32 fails and the overlays that need it (the main-menu hotkey guide, the credits pill)
-// stay hidden until the real addresses are filled in.
+// is FrightWorks-no100f's (shared overlay code reads it); this game's addresses are not mapped yet. They are 0 for now,
+// and address 0 is readable guest RAM (the disc ID, "G5DE"), so a read there succeeds: every reader checks
+// kAddressesMapped first. Until then the overlays that need it (the main-menu hotkey guide, the credits pill) stay
+// hidden and the log's hang and movie lines leave the game's state out.
 namespace no100f_game_state {
+
+// Whether the addresses below are this game's. Set it when they are filled in.
+inline constexpr bool kAddressesMapped = false;
 
 // Game mode: not mapped for Unmasked yet.
 inline constexpr uint32_t kModeAddress = 0;
@@ -35,7 +39,8 @@ constexpr bool IsMainMenu(uint32_t mode, uint32_t state, uint32_t movie) {
     return false;
 }
 
-// The last Bink movie the game opened is a credits roll. Nothing sets it for Unmasked yet.
+// The last Bink movie the game opened is a credits roll (set from the file name, hle/storage/dvd.cpp). The credits pill
+// also needs kMovieAddress to tell when it ends.
 inline std::atomic<bool> g_creditsMovie{false};
 
 // The file name of the last Bink movie the game opened, for the log's movie lines.

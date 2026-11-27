@@ -2767,7 +2767,7 @@ void DrawCard(ImDrawList* list, const GuideCard& card, ImVec2 min) {
 void DrawHotkeyGuide() {
     using namespace OverlayTheme;
     uint32_t mode = 0, state = 0, movie = 0;
-    const bool show = !g_topBarVisible && !no100f_devmenu::IsOpen() &&
+    const bool show = !g_topBarVisible && !no100f_devmenu::IsOpen() && no100f_game_state::kAddressesMapped &&
                       Memory::TryRead32(no100f_game_state::kModeAddress, mode) &&
                       Memory::TryRead32(no100f_game_state::kStateAddress, state) &&
                       Memory::TryRead32(no100f_game_state::kMovieAddress, movie) &&
@@ -2842,6 +2842,7 @@ void DrawCreditsPill() {
     uint32_t movie = 0;
     const bool show = !g_topBarVisible &&
                       no100f_game_state::g_creditsMovie.load(std::memory_order_relaxed) &&
+                      no100f_game_state::kAddressesMapped &&
                       Memory::TryRead32(no100f_game_state::kMovieAddress, movie) && movie != 0;
     const float step = ImGui::GetIO().DeltaTime / 0.5f;
     g_creditsPillAlpha = std::clamp(g_creditsPillAlpha + (show ? step : -step), 0.0f, 1.0f);

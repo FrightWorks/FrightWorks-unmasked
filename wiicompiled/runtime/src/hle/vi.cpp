@@ -432,14 +432,14 @@ static uint32_t (*const g_spmFramesFn)() = &SpmPresentedFramesLocal;
         }
         reported = true;
         // The game's mode, state and movie, where no100f_game_state knows this game's addresses (not yet for
-        // Scooby-Doo! Unmasked: the reads fail and the line leaves them out).
+        // Scooby-Doo! Unmasked: kAddressesMapped is false and the line leaves them out).
         uint32_t mode = 0, state = 0, movie = 0;
         std::string where;
-        if (Memory::TryRead32(no100f_game_state::kModeAddress, mode) &&
+        if (no100f_game_state::kAddressesMapped && Memory::TryRead32(no100f_game_state::kModeAddress, mode) &&
             Memory::TryRead32(no100f_game_state::kStateAddress, state)) {
             where += ": game mode " + std::to_string(mode) + " state " + std::to_string(state);
         }
-        if (Memory::TryRead32(no100f_game_state::kMovieAddress, movie)) {
+        if (no100f_game_state::kAddressesMapped && Memory::TryRead32(no100f_game_state::kMovieAddress, movie)) {
             where += std::string(", movie ") + (movie != 0 ? no100f_game_state::LastMovieName() : "none");
         }
         RT_LOGF(RT_TAG_VI, "[hang] no new frame for %lld s (last frame %u)%s; guest threads:\n",
@@ -457,7 +457,8 @@ void LogMovieChanges() {
     static Clock::time_point s_openedAt{};
     static std::string s_name;
     uint32_t movie = 0;
-    if (!Memory::TryRead32(no100f_game_state::kMovieAddress, movie) || movie == s_movie) {
+    if (!no100f_game_state::kAddressesMapped || !Memory::TryRead32(no100f_game_state::kMovieAddress, movie) ||
+        movie == s_movie) {
         return;
     }
     const uint32_t frame = s_presentedXfbFrames.load(std::memory_order_relaxed);
