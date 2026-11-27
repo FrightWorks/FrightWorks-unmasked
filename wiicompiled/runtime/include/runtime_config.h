@@ -1349,7 +1349,8 @@ inline bool TextureReplacements(bool fallback = true) {
 // [video] cutout_mode: how cut-out draws (leaves, grass, webs) are drawn, as aurora_set_cutout_mode takes it:
 // "game" 0 = the game's own alpha test, "cut" 1 = alpha > 127 for HD replacements, "twopass" 2 = solid and faint parts
 // in two passes for HD replacements, "twopass_all" 3 = two passes for original textures too.
-inline int CutoutMode(int fallback = 3) {
+// Default "game": the two-pass modes came from no100f, where they fix that game's cut-outs; Unmasked never needed them.
+inline int CutoutMode(int fallback = 0) {
     return Get().cutoutMode.value_or(fallback);
 }
 
