@@ -1462,16 +1462,6 @@ void DrawVideoSettings() {
                     aurora_set_motion_blur(RuntimeConfigFile::MotionBlurShutter(percent));
                     RuntimeConfigFile::SetMotionBlur(percent);
                 });
-#ifdef AURORA_HAS_INK_OUTLINES
-    {
-        int level = std::clamp(RuntimeConfigFile::InkOutlines(), 0, 2);
-        if (MenuRows::Choice("Ink outlines", &level, RuntimeConfigFile::kInkOutlineLevels, 3)) {
-            aurora_set_ink_outlines(level);
-            RuntimeConfigFile::SetInkOutlines(level);
-        }
-        MenuRows::Describe("Cartoon lines around characters and objects. Bold also draws sharp edges inside them.");
-    }
-#endif
 #ifdef AURORA_HAS_SCENE_STAGE
     levelChoice("Ambient occlusion", std::clamp(RuntimeConfigFile::AmbientOcclusion(), 0, 100),
                 RuntimeConfigFile::kAmbientOcclusionLevels, "Soft shade where surfaces meet: in corners, creases and under things.",

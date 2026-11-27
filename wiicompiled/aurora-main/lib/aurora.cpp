@@ -945,7 +945,6 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) {
   // Before the graphics start, so the pipeline prewarm builds the kind the first frames use.
   gfx::motion::set_blur(g_config.motionBlur);
   gfx::scene_stage::set_ambient_occlusion(g_config.ambientOcclusion);
-  gfx::scene_stage::set_ink_outlines(g_config.inkOutlines);
   gfx::bloom::set_strength(g_config.bloom);
 #endif
   if (g_config.maxTextureAnisotropy == 0) {
@@ -2588,18 +2587,6 @@ float aurora_get_ambient_occlusion() {
   return aurora::gfx::scene_stage::ambient_occlusion();
 #else
   return 0.f;
-#endif
-}
-void aurora_set_ink_outlines(int level) {
-#ifdef AURORA_ENABLE_GX
-  aurora::gfx::scene_stage::set_ink_outlines(level);
-#endif
-}
-int aurora_get_ink_outlines() {
-#ifdef AURORA_ENABLE_GX
-  return aurora::gfx::scene_stage::ink_outlines();
-#else
-  return 0;
 #endif
 }
 void aurora_set_bloom(float strength) {

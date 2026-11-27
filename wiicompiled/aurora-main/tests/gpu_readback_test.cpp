@@ -721,7 +721,7 @@ void draw_same_state_frame(bool settingChanged) {
 // LateLayer: as Layer, then a late blended surface in front of it (alpha 0, writing depth, the place the game draws the
 // faded door and wall pieces in): it must stay after the second layer, or its depth hides the layer.
 // MergedLayers: two solid quads that merge into one draw, each drawn a second time see-through.
-enum class StageScene { Basic, Crease, Layer, SplitBetween, SplitTail, SplitMidTail, LateLayer, MergedLayers, NoCamera, ThinThing, Ridge };
+enum class StageScene { Basic, Crease, Layer, SplitBetween, SplitTail, SplitMidTail, LateLayer, MergedLayers, NoCamera };
 void draw_stage_frame(StageScene scene = StageScene::Basic) {
   const bool crease = scene == StageScene::Crease;
   gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
@@ -798,24 +798,6 @@ void draw_stage_frame(StageScene scene = StageScene::Basic) {
       GXColor4u8(0, 255, 0, 128);
     }
     GXEnd();
-  } else if (scene == StageScene::Ridge) {
-    // Two faces meeting at column 32, 90 degrees apart, the ridge nearest the camera: a sharp turn, no silhouette.
-    for (const float side : {-1.f, 1.f}) {
-      GXBegin(GX_QUADS, GX_VTXFMT0, 4);
-      for (const auto& v : std::array<std::array<float, 3>, 4>{
-               {{0.f, 1.5f, -4.f}, {side, 1.5f, -5.f}, {side, -1.5f, -5.f}, {0.f, -1.5f, -4.f}}}) {
-        GXPosition3f32(v[0], v[1], v[2]);
-        GXColor4u8(200, 200, 200, 255);
-      }
-      GXEnd();
-    }
-    GXSetZMode(true, GX_LEQUAL, false);
-    quad(.9f, .95f, {0, 255, 0, 128});
-  } else if (scene == StageScene::ThinThing) {
-    // Two columns wide (16 and 17), thinner than Bold's line.
-    quad(-.5f, -.4375f, {255, 0, 0, 255});
-    GXSetZMode(true, GX_LEQUAL, false);
-    quad(.1f, .9f, {0, 255, 0, 128});
   } else if (scene == StageScene::MergedLayers) {
     quad(-.9f, -.5f, {255, 0, 0, 255});
     quad(-.5f, -.1f, {255, 0, 0, 255});
@@ -1334,9 +1316,8 @@ int main(int argc, char** argv) {
       gfx::scene_stage::set_view(0);
       std::printf("Actual Aurora scene stage: second layers stay before a late surface, merged solids keep theirs\n");
     }
-    // Ink outlines: the solid quad (columns 3 to 28, 4 units away) stands in front of nothing, so its silhouette inks
-    // on the quad's side (column 3, 85% dark at Thin: 255 x 0.15 = 38) and nowhere inside it (column 4 is a pixel in,
-    // the middle at 16). The outline view shows the line alone, black on white. Off, nothing changes.
+    // With no camera that can be inverted, the stage leaves the picture alone: the 2D quad keeps its colour, with the
+    // ambient occlusion on and in the depth view.
     {
       const auto settle = [](StageScene scene = StageScene::Basic) {
         const auto frame_of = [scene] {
@@ -1347,53 +1328,13 @@ int main(int argc, char** argv) {
         };
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         for (unsigned frame = 0; frame < 2 || gfx::queued_pipeline_count() != 0; ++frame) {
-          require(std::chrono::steady_clock::now() < deadline, "Ink outline pipelines were not built");
+          require(std::chrono::steady_clock::now() < deadline, "Scene stage pipelines were not built");
           frame_of();
           webgpu::g_instance.ProcessEvents();
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         frame_of();
       };
-      gfx::scene_stage::set_ink_outlines(1);
-      settle();
-      check_efb(3, 32, {38, 0, 0}, "ink on the silhouette");
-      check_efb(4, 32, {255, 0, 0}, "no ink a pixel inside");
-      check_efb(16, 32, {255, 0, 0}, "no ink in the middle");
-      check_efb(48, 32, {0, 128, 0}, "see-through after the ink");
-      gfx::scene_stage::set_view(4);
-      settle();
-      check_efb(3, 32, {0, 0, 0}, "outline view, line");
-      check_efb(16, 32, {255, 255, 255}, "outline view, inside");
-      gfx::scene_stage::set_view(0);
-      // Bold: the same silhouette, a line two columns wide here and 90% dark (255 x 0.1 = 25), nothing inside it.
-      gfx::scene_stage::set_ink_outlines(2);
-      settle();
-      check_efb(3, 32, {25, 0, 0}, "bold ink on the silhouette");
-      check_efb(4, 32, {25, 0, 0}, "bold ink, second column");
-      check_efb(5, 32, {255, 0, 0}, "no bold ink past the line");
-      check_efb(16, 32, {255, 0, 0}, "no bold ink in the middle");
-      check_efb(48, 32, {0, 128, 0}, "see-through after the bold ink");
-      // Something thinner than the line drops away on both sides, so it keeps its colour.
-      settle(StageScene::ThinThing);
-      check_efb(16, 32, {255, 0, 0}, "bold keeps a thin thing's colour, left");
-      check_efb(17, 32, {255, 0, 0}, "bold keeps a thin thing's colour, right");
-      // A flat wall and floor have no line across them, whatever the angle (view 4: white = no line).
-      gfx::scene_stage::set_view(4);
-      settle(StageScene::Crease);
-      check_efb(32, 30, {255, 255, 255}, "no bold line across the wall");
-      check_efb(32, 44, {255, 255, 255}, "no bold line across the floor");
-      // Nor is a sharp turn of the surface a line: Bold inks silhouettes only.
-      settle(StageScene::Ridge);
-      for (const unsigned column : {28u, 29u, 30u, 31u, 32u, 33u, 34u, 35u}) {
-        check_efb(column, 32, {255, 255, 255}, "no bold line on a ridge");
-      }
-      gfx::scene_stage::set_view(0);
-      // With no camera that can be inverted, the stage leaves the picture alone: the 2D quad keeps its colour.
-      settle();
-      settle(StageScene::NoCamera);
-      check_efb(16, 32, {255, 255, 255}, "no camera, edge of the 2D quad");
-      check_efb(24, 32, {255, 255, 255}, "no camera, middle of the 2D quad");
-      gfx::scene_stage::set_ink_outlines(0);
       gfx::scene_stage::set_ambient_occlusion(1.f);
       settle();
       settle(StageScene::NoCamera);
@@ -1404,13 +1345,7 @@ int main(int argc, char** argv) {
       settle(StageScene::NoCamera);
       check_efb(24, 32, {255, 255, 255}, "no camera, no depth view");
       gfx::scene_stage::set_view(0);
-      gfx::scene_stage::set_ink_outlines(2);
-      gfx::scene_stage::set_ink_outlines(0);
-      settle();
-      check_efb(3, 32, {255, 0, 0}, "ink off");
-      std::printf(
-          "Actual Aurora ink outlines: silhouette inked on the quad's own side, Bold wider with thin things kept, no camera "
-          "no stage, view black on white, off clean\n");
+      std::printf("Actual Aurora scene stage: no camera, no stage\n");
     }
     // Bloom: of two equally bright white quads, the one whose texture is on the light list glows past its outer edge
     // (column 5, three left of the left quad; column 58, three right of the right quad) and the other does not, either

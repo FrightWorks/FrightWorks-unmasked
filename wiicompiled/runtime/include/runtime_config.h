@@ -37,7 +37,6 @@ struct RuntimeUserConfig {
     std::optional<int32_t> aspectMode;  // 0 original 4:3, 1 16:9, 2 fill the window (DisplaySettings)
     std::optional<int32_t> motionBlur;  // [video] motion_blur: strength in percent, 0 = off (MotionBlurShutter)
     std::optional<int32_t> ambientOcclusion;  // [video] ambient_occlusion: strength in percent, 0 = off
-    std::optional<int32_t> inkOutlines;  // [video] ink_outlines: 0 off, 1 thin, 2 bold
     std::optional<int32_t> bloom;  // [video] bloom: strength in percent, 0 = off
     std::optional<int32_t> gpuCompat;  // 0 auto (by graphics adapter), 1 on, 2 off (AuroraGpuCompat)
     std::optional<int32_t> windowPosX;
@@ -373,8 +372,6 @@ inline void EnsureConfigFile() {
               "# ambient occlusion (experimental: shade in creases, corners and under things) in percent: 0 = off, 35 = low,\n"
               "# 65 = medium\n"
               "ambient_occlusion = 0\n"
-              "# cartoon ink outlines: 0 = off, 1 = thin, 2 = bold\n"
-              "ink_outlines = 0\n"
               "# bloom (experimental: a soft glow around lit windows, lamp light, fire and sparkles) in percent: 0 = off,\n"
               "# 40 = low, 70 = medium, 100 = high\n"
               "bloom = 0\n"
@@ -553,9 +550,6 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     }
     if (auto value = FindConfigInt(document, "video", "ambient_occlusion"); value && *value >= 0 && *value <= 100) {
         config.ambientOcclusion = *value;
-    }
-    if (auto value = FindConfigInt(document, "video", "ink_outlines"); value && *value >= 0 && *value <= 2) {
-        config.inkOutlines = *value;
     }
     if (auto value = FindConfigInt(document, "video", "bloom"); value && *value >= 0 && *value <= 100) {
         config.bloom = *value;
@@ -1110,18 +1104,6 @@ inline bool SetAmbientOcclusion(int32_t value) {
     return WriteSetting("video", "ambient_occlusion", std::to_string(value));
 }
 
-// Cartoon ink outlines: 0 off, 1 thin, 2 bold (aurora_set_ink_outlines).
-inline int32_t InkOutlines(int32_t fallback = 0) {
-    return Get().inkOutlines.value_or(fallback);
-}
-
-inline constexpr const char* kInkOutlineLevels[] = {"Off", "Thin", "Bold"};
-
-inline bool SetInkOutlines(int32_t value) {
-    Mutable().inkOutlines = value;
-    return WriteSetting("video", "ink_outlines", std::to_string(value));
-}
-
 // Bloom strength in percent, 0 = off (aurora_set_bloom takes it as 0 to 1). The menus offer the levels below; any other
 // value from 0 to 100 works too.
 inline int32_t Bloom(int32_t fallback = 0) {
@@ -1591,9 +1573,6 @@ inline void LogLoadedConfig() {
             }
             if (config.ambientOcclusion) {
                 std::cout << " ambient_occlusion=" << *config.ambientOcclusion;
-            }
-            if (config.inkOutlines) {
-                std::cout << " ink_outlines=" << *config.inkOutlines;
             }
             if (config.bloom) {
                 std::cout << " bloom=" << *config.bloom;

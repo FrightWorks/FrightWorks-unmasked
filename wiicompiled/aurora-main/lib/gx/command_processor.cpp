@@ -2831,7 +2831,7 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
 }
 
 // Whether the world is drawn in order (solid scene, then its see-through draws): only while the scene stage
-// (scene_stage.hpp: ambient occlusion, ink outlines, bloom, its views) needs the point between the two.
+// (scene_stage.hpp: ambient occlusion, bloom, its views) needs the point between the two.
 static bool world_ordering_enabled() noexcept { return gfx::scene_stage::wanted(); }
 
 // Whether a draw in the current state is part of the ordered world.
