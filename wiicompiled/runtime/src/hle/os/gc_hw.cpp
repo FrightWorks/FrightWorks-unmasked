@@ -107,13 +107,18 @@ extern "C" void ARQPostRequest_Gc(uint32_t request, uint32_t owner, uint32_t typ
     if (type == 0) AramCopy(0, source, dest, length);
     else AramCopy(1, dest, source, length);
     QueueGuestCallback(callback, request, 0);
-    // The copy is done, so complete it now, as the ARQ interrupt would just after the transfer. Callers can spin on a
-    // flag the callback sets (G5DE78 AMPushBuffered, loading sound banks: `while (!done) {}`). Left on the queue it ran
-    // only at the next disc read, after that loop; translated, the loop is an empty infinite loop, which the Windows
-    // build happened to drop and the Linux build kept, hanging on the loading screen. The callback runs on a private
-    // register copy like other interrupts; one that posts another request is delivered by this same drain.
-    GuestInterruptCallbackContext interrupt;
-    DvdProcessPendingCallbacks(interrupt.get());
+    // AMPushBuffered (loading sound banks) posts and then spins until this callback sets its flag: `while (!done) {}`.
+    // Left on the queue the callback ran only at the next disc read, after that loop; translated, the loop is an empty
+    // infinite loop, which the Windows build happened to drop and the Linux build kept, hanging on the loading screen.
+    // So complete that one now, on a private register copy like other interrupts. Only that one: the stream refills
+    // (SOUND_ProcessStreams) read their staging buffer after posting, and SOUND_UpdateStreamCB starts the next disc
+    // read into it, which here lands at once - run early, the voice got the next chunk's ADPCM header and streamed
+    // music and voices stuttered.
+    constexpr uint32_t kAmPushBufferedDone = 0x80128358u;
+    if (callback == kAmPushBufferedDone) {
+        GuestInterruptCallbackContext interrupt;
+        DvdProcessPendingCallbacks(interrupt.get());
+    }
 }
 PPC_NATIVE_OVERRIDE_VOID(8015B264, ARQPostRequest_Gc,
     (uint32_t r, uint32_t o, uint32_t t, uint32_t p, uint32_t s, uint32_t d, uint32_t l, uint32_t c),
