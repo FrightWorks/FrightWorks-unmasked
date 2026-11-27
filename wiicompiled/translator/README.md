@@ -35,15 +35,15 @@ See `projects/examples/generic-dol.yml` for a minimal manifest driven by `RECOMP
 
 | Tool | Notes |
 | --- | --- |
-| .NET 8 SDK | Builds and runs the translator. |
+| .NET 10 SDK | Builds and runs the translator. |
 | CMake ≥ 3.25 and Ninja | Configures and drives the native build. |
 | Clang / LLVM | The shipped build uses LLVM-MinGW targeting `x86-64-v3`. MSVC is not the tested path. |
 
 Build the CLI once and invoke the assembly directly:
 
 ```powershell
-dotnet build translator/src/Translator.Cli/Translator.Cli.csproj -c Release
-$translator = 'translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll'
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'; dotnet build translator/src/Translator.Cli/Translator.Cli.csproj -c Release
+$translator = 'translator/src/Translator.Cli/bin/Release/net10.0/Translator.Cli.dll'
 ```
 
 ## Manifest essentials
@@ -66,12 +66,12 @@ Relative paths resolve from `workspace_root`, which itself resolves from the man
 -  `generate-data-init --project path`
 -  `emit-base-manifest --project path`
 -  `emit-build-shards --project path`
--  `translate-mod --project path [--profile name] ...` - static Kamek/Pulsar module translation
+-  `translate-mod --project path [--profile name] ...` - static Kamek module translation
 
 Any command prints its own option list with `--help`.
 
 ## Test
 
 ```powershell
-dotnet test translator/Translator.sln -c Release
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'; dotnet test translator/Translator.sln -c Release
 ```

@@ -1,4 +1,4 @@
-extern "C" unsigned g_spmAudit[8];
+extern "C" unsigned g_gxAudit[8];
 #include <filesystem>
 #include <cstdlib>
 #include "gx.hpp"
@@ -21,6 +21,7 @@ extern "C" unsigned g_spmAudit[8];
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <chrono>
 #include <cstdint>
@@ -28,6 +29,7 @@ extern "C" unsigned g_spmAudit[8];
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -557,8 +559,8 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
 
 } // namespace
 
-// NSMBW: every cached static texture whose RAM contains `dest`, with the patch's place in it. A copy
-// into part of a texture (NSMBW's animated tiles patch the tile atlas) is then applied on the GPU.
+// Every cached static texture whose RAM contains `dest`, with the patch's place in it. A copy
+// into part of a texture (animated tiles patching a tile atlas) is then applied on the GPU.
 std::vector<PatchTarget> find_patch_targets(const void* dest) {
   std::vector<PatchTarget> targets;
   const auto* d = static_cast<const uint8_t*>(dest);
@@ -597,10 +599,27 @@ std::vector<PatchTarget> find_patch_targets(const void* dest) {
 
 namespace {
 
+// Dev menu (F8): name the texture by its replacement key for the texture log (the shared magenta highlight
+// texture is renamed for whichever key Find highlights).
+// Also notes the texture for the dev menu's drawn list while it is on (every resolve: the caches are dropped when the
+// list is reset, so everything on screen comes through here again).
+static void note_debug_key(const gfx::TextureHandle& handle, const GXTexObj_& obj,
+                           const GXTlutObj_* tlut = nullptr) noexcept {
+  if (!handle) {
+    return;
+  }
+  const bool keep = !handle->debugKey.empty() && !gfx::texture_replacement::is_highlight_handle(handle);
+  if (keep && !gfx::texture_replacement::tracking_drawn()) {
+    return;
+  }
+  auto name = gfx::texture_replacement::note_drawn_texture(obj, tlut, handle);
+  if (!keep) handle->debugKey = std::move(name);
+}
+
 gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   ZoneScoped;
-  static const bool spmTexNoCache = std::getenv("SPM_TEX_NOCACHE") != nullptr;
-  const bool canCacheUpload = !spmTexNoCache && !obj.no_cache() && can_cache_static_texture_upload(obj);
+  static const bool gxTexNoCache = std::getenv("NO100F_TEX_NOCACHE") != nullptr;
+  const bool canCacheUpload = !gxTexNoCache && !obj.no_cache() && can_cache_static_texture_upload(obj);
 
   if (canCacheUpload && obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
@@ -653,6 +672,7 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
     handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
                                         {static_cast<const uint8_t*>(obj.data), dataSize}, false, nameStr);
   }
+  note_debug_key(handle, obj);
   if (canCacheUpload) {
     store_cached_texture(obj, handle);
     if (canUseSourceCache) {
@@ -673,8 +693,8 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut) {
   ZoneScoped;
 
-  static const bool spmTexNoCachePal = std::getenv("SPM_TEX_NOCACHE") != nullptr;
-  if (!spmTexNoCachePal && obj.texObjId != 0) {
+  static const bool gxTexNoCachePal = std::getenv("NO100F_TEX_NOCACHE") != nullptr;
+  if (!gxTexNoCachePal && obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
       const auto& entry = it->second;
       if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
@@ -685,7 +705,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     }
   }
 
-  const bool canUseSourceCache = !spmTexNoCachePal && !obj.no_cache() && !tlut.no_cache() && obj.data != nullptr && tlut.data != nullptr;
+  const bool canUseSourceCache = !gxTexNoCachePal && !obj.no_cache() && !tlut.no_cache() && obj.data != nullptr && tlut.data != nullptr;
   const StaticPaletteTextureKey sourceKey =
       canUseSourceCache ? make_static_palette_texture_key(obj, tlut) : StaticPaletteTextureKey{};
   if (canUseSourceCache) {
@@ -705,7 +725,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
   }
 
   gfx::TextureHandle handle;
-  if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
+  if (const auto replacement = gfx::texture_replacement::find_replacement(obj, &tlut); replacement.has_value()) {
     handle = *replacement;
   } else {
     const u32 dataSize = GXGetTexBufferSize(static_cast<u16>(obj.width()), static_cast<u16>(obj.height()),
@@ -722,6 +742,7 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
                                    {converted.data.data(), converted.data.size()}, false, "GX Static Palette Texture");
     handle->hasArbitraryMips = converted.hasArbitraryMips;
   }
+  note_debug_key(handle, obj, &tlut);
   if (!obj.no_cache() && !tlut.no_cache()) {
     store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
     if (canUseSourceCache) {
@@ -965,7 +986,7 @@ MappedRenderState map_logical_render_state() noexcept {
 namespace {
 void apply_logical_render_state() noexcept;
 // The mapped viewport/scissor bake in the render-target scale. A game that sets its viewport once and then changes
-// the VI mode (Scooby-Doo! Unmasked: 640x480 -> 640x448) resizes the target afterwards; re-map after every resize
+// the VI mode (for example 640x480 -> 640x448) resizes the target afterwards; re-map after every resize
 // (it stopped 448*2.25 rows into a 448*2.41-row target: a black strip at the bottom).
 void reapply_after_resize() { apply_logical_render_state(); }
 
@@ -1003,11 +1024,16 @@ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcep
 
   const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
   const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+  // Games compute the viewport scale in float (NO100F's 640 arrives as 639.99997); scaled, that ends a hair short
+  // of the last pixel, which then never gets drawn (a 1 px line of clear colour at the right and bottom).
+  // Snap edges within 0.01 px of a whole pixel onto it.
+  const auto snap = [](float v) { const float r = std::round(v); return std::abs(v - r) < 0.01f ? r : v; };
+  const float left = snap(logicalViewport.left * scaleX), top = snap(logicalViewport.top * scaleY);
   return {
-      .left = logicalViewport.left * scaleX,
-      .top = logicalViewport.top * scaleY,
-      .width = logicalViewport.width * scaleX,
-      .height = logicalViewport.height * scaleY,
+      .left = left,
+      .top = top,
+      .width = snap(left + logicalViewport.width * scaleX) - left,
+      .height = snap(top + logicalViewport.height * scaleY) - top,
       .znear = logicalViewport.znear,
       .zfar = logicalViewport.zfar,
   };
@@ -1184,6 +1210,119 @@ void invalidate_static_texture_cache() noexcept {
   g_gxState.stateDirty = true;
 }
 
+// Dev menu (F8): a revision bump alone lets the source caches re-prove their old handles, so drop them all and
+// every texture goes through find_replacement again (texture highlight on/off).
+static void drop_static_texture_caches() noexcept;
+
+// Dev menu (F8): while the dev menu's Find highlights a texture, every distinct GX state it is drawn with goes
+// to devmenu_drawstate.txt (working directory = Play): alpha compare, blending, depth test/write.
+static std::vector<std::string> s_drawStatesLogged;
+
+static void log_highlight_draw_state(const ShaderInfo& info) noexcept {
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    if (!info.sampledTextures.test(i) || !gfx::texture_replacement::is_highlight_handle(g_gxState.textures[i].ref)) {
+      continue;
+    }
+    const auto& s = g_gxState;
+    const auto& ac = s.alphaCompare;
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "texmap %u | alpha compare %d %u op %d %d %u | blend mode %d src %d dst %d | z test %d func %d write %d "
+                  "before-tex %d | color write %d alpha write %d",
+                  i, ac.comp0, ac.ref0, ac.op, ac.comp1, ac.ref1, s.blendMode, s.blendFacSrc, s.blendFacDst,
+                  s.depthCompare, s.depthFunc, s.depthUpdate, s.zCompLocBeforeTex, s.colorUpdate, s.alphaUpdate);
+    if (s_drawStatesLogged.size() >= 32 ||
+        std::find(s_drawStatesLogged.begin(), s_drawStatesLogged.end(), line) != s_drawStatesLogged.end()) {
+      return;
+    }
+    s_drawStatesLogged.emplace_back(line);
+    if (FILE* f = std::fopen("devmenu_drawstate.txt", "a")) {
+      std::fprintf(f, "%s\n", line);
+      std::fclose(f);
+    }
+    return;
+  }
+}
+
+// Dev menu (F8): texture log. While the dev menu's log is on, the first draw of each texture key with each
+// distinct sampler and GX state in each scene appends a row to devmenu_texlog.csv (working directory = Play).
+// Static textures only (EFB copies have no key). width/height = the game's texture, file_* = what was uploaded
+// (the replacement when replacement = 1).
+static const char* gx_name(u32 v, std::initializer_list<const char*> names) noexcept {
+  return v < names.size() ? names.begin()[v] : "?";
+}
+
+static void log_texture_draw_states(const ShaderInfo& info) noexcept {
+  static uint32_t generation = UINT32_MAX;
+  static std::string scene;
+  static absl::flat_hash_set<std::string> logged;
+  if (const uint32_t g = gfx::texture_replacement::texture_log_generation(); g != generation) {
+    generation = g;
+    scene = gfx::texture_replacement::texture_log_scene();
+  }
+  if (scene.empty()) {
+    return;
+  }
+  const auto& s = g_gxState;
+  const auto& ac = s.alphaCompare;
+  const std::initializer_list<const char*> compare{"never", "less", "equal", "lequal", "greater", "nequal", "gequal", "always"};
+  const std::initializer_list<const char*> factor{"zero", "one", "clr", "invclr", "srcalpha", "invsrcalpha", "dstalpha", "invdstalpha"};
+  const std::initializer_list<const char*> filter{"near", "linear", "near_mip_near", "lin_mip_near", "near_mip_lin", "lin_mip_lin"};
+  const std::initializer_list<const char*> wrap{"clamp", "repeat", "mirror"};
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& bind = s.textures[i];
+    if (!info.sampledTextures.test(i) || !bind || bind.ref->debugKey.empty()) {
+      continue;
+    }
+    const auto& ref = *bind.ref;
+    const auto& obj = bind.texObj;
+    char row[640];
+    std::snprintf(row, sizeof row,
+                  "%s,%s,%d,%u,%u,%u,%s,%s,%s,%s,%u,%.3f,%.3f,%.3f,%s,%u,%s,%s,%u,%s,%s,%s,%d,%s,%d,%d,%d,%d,%u,%u,%u",
+                  scene.c_str(), ref.debugKey.c_str(), ref.isReplacement ? 1 : 0, i, obj.width(), obj.height(),
+                  gx_name(obj.wrap_s(), wrap), gx_name(obj.wrap_t(), wrap), gx_name(obj.min_filter(), filter),
+                  gx_name(obj.mag_filter(), filter), obj.has_mips() ? obj.mip_count() : 1u, obj.min_lod(), obj.max_lod(),
+                  obj.lod_bias(), gx_name(ac.comp0, compare), static_cast<u32>(ac.ref0),
+                  gx_name(ac.op, {"and", "or", "xor", "xnor"}), gx_name(ac.comp1, compare), static_cast<u32>(ac.ref1),
+                  gx_name(s.blendMode, {"none", "blend", "logic", "subtract"}), gx_name(s.blendFacSrc, factor),
+                  gx_name(s.blendFacDst, factor), s.depthCompare ? 1 : 0, gx_name(s.depthFunc, compare),
+                  s.depthUpdate ? 1 : 0, s.zCompLocBeforeTex ? 1 : 0, s.colorUpdate ? 1 : 0, s.alphaUpdate ? 1 : 0,
+                  ref.size.width, ref.size.height, ref.mipCount);
+    if (!logged.insert(row).second) {
+      continue;
+    }
+    const bool fresh = !std::filesystem::exists("devmenu_texlog.csv");
+    if (FILE* f = std::fopen("devmenu_texlog.csv", "a")) {
+      if (fresh) {
+        std::fputs("scene,key,replacement,texmap,width,height,wrap_s,wrap_t,min_filter,mag_filter,mips,min_lod,max_lod,"
+                   "lod_bias,alpha_comp0,alpha_ref0,alpha_op,alpha_comp1,alpha_ref1,blend_mode,blend_src,blend_dst,"
+                   "z_test,z_func,z_write,z_before_tex,color_write,alpha_write,file_width,file_height,file_mips\n",
+                   f);
+      }
+      std::fprintf(f, "%s\n", row);
+      std::fclose(f);
+    }
+  }
+}
+
+static void drop_static_texture_caches() noexcept {
+  s_textureObjectCaches.clear();
+  s_tlutObjectCaches.clear();
+  s_staticTextureSourceCache.clear();
+  s_staticPaletteTextureSourceCache.clear();
+  s_texObjSourceKeys.clear();
+  s_texObjPaletteSourceKeys.clear();
+  s_texObjSourceKeyMemo.reset();
+  s_texObjPaletteSourceKeyMemo.reset();
+  clear_static_source_front_cache();
+  for (auto& entry : s_textureResolveIdentityCache) {
+    entry.valid = false;
+    entry.binding.reset();
+  }
+  ++s_textureCacheStamps;  // so the bump below isn't skipped
+  invalidate_static_texture_cache();
+}
+
 void clear_copy_texture_cache() noexcept {
   g_gxState.copyTextures.clear();
   g_gxState.copyTextureCache.clear();
@@ -1202,7 +1341,7 @@ void clear_display_copy_cache() noexcept {
   g_gxState.displayCopyHeight = 0;
 }
 
-void set_display_copy_present_source() noexcept {
+void set_display_copy_present_source(std::array<float, 4> efbRect) noexcept {
   if (!g_gxState.displayCopyTexture) {
     return;
   }
@@ -1210,7 +1349,8 @@ void set_display_copy_present_source() noexcept {
   g_gxState.displayCopyBindGroup = webgpu::create_copy_bind_group(g_gxState.displayCopyTexture->sampleTextureView,
                                                                   webgpu::present_source().sampler);
   webgpu::set_present_source_override(g_gxState.displayCopyBindGroup, g_gxState.displayCopyTexture->texture,
-                                      g_gxState.displayCopyTexture->size, g_gxState.displayCopyTexture->format);
+                                      g_gxState.displayCopyTexture->size, g_gxState.displayCopyTexture->format,
+                                      efbRect);
 }
 
 void evict_copy_texture(const void* dest) noexcept {
@@ -1246,7 +1386,7 @@ void evict_copy_texture(const void* dest) noexcept {
       }
     }
   }
-  // NSMBW: the pooled GPU textures stay: a destination evicted and copied again every frame (the
+  // The pooled GPU textures stay: a destination evicted and copied again every frame (the
   // animated tiles) reuses them instead of creating new ones; the pool releases idle ones itself.
   if (changed) {
     mark_copy_texture_cache_changed();
@@ -1317,8 +1457,8 @@ GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noex
   }
 
   if (auto* cached = find_cached_copy_texture(obj.data, obj)) {
-    // NSMBW debugging: NSMBW_LOG_STALE_COPIES logs copies sampled in a frame that didn't produce them.
-    static const bool logStale = std::getenv("NSMBW_LOG_STALE_COPIES") != nullptr;
+    // Debugging: NO100F_LOG_STALE_COPIES logs copies sampled in a frame that didn't produce them.
+    static const bool logStale = std::getenv("NO100F_LOG_STALE_COPIES") != nullptr;
     if (logStale && cached->lastProducedFrame != gfx::current_frame()) {
       static u32 lastFrame = 0, count = 0;
       if (lastFrame != gfx::current_frame()) {
@@ -1336,9 +1476,9 @@ GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noex
     mark_copy_texture_sampled(obj.data, exact->second);
     return &exact->second;
   }
-  // NSMBW debugging: NSMBW_LOG_COPY_MISSES logs a texture whose address holds an EFB copy that it
+  // Debugging: NO100F_LOG_COPY_MISSES logs a texture whose address holds an EFB copy that it
   // doesn't match (so it falls back to guest RAM, which GPU-only copies never wrote).
-  static const bool logMisses = std::getenv("NSMBW_LOG_COPY_MISSES") != nullptr;
+  static const bool logMisses = std::getenv("NO100F_LOG_COPY_MISSES") != nullptr;
   if (logMisses) {
     static int logged = 0;
     const GXState::CopyTextureRef* other = exact != g_gxState.copyTextures.end() ? &exact->second : nullptr;
@@ -1362,9 +1502,26 @@ GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_& obj) noex
   return nullptr;
 }
 
+// The button prompt set changed. The prompt atlas's guest bytes did not, so the source caches (checked against those
+// bytes) would keep handing out the old set's texture: drop their replacement textures (texture_replacement keeps its
+// own cache of the others) and bump the revision so the per-object caches resolve again.
+static void drop_replacement_texture_sources() noexcept {
+  const auto isReplacement = [](const auto& item) { return item.second.handle && item.second.handle->isReplacement; };
+  absl::erase_if(s_staticTextureSourceCache, isReplacement);
+  absl::erase_if(s_staticPaletteTextureSourceCache, isReplacement);
+  clear_static_source_front_cache();
+  ++s_textureCacheStamps;
+  invalidate_static_texture_cache();
+}
+
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {
   ZoneScoped;
-  if (gfx::texture_replacement::take_button_icon_style_change()) invalidate_static_texture_cache();
+  if (gfx::texture_replacement::take_button_icon_style_change()) drop_replacement_texture_sources();
+  if (gfx::texture_replacement::take_highlight_change()) {
+    drop_static_texture_caches();
+    s_drawStatesLogged.clear();
+  }
+  if (gfx::texture_replacement::take_reload()) drop_static_texture_caches();
 
   for (u32 i = 0; i < MaxTextures; ++i) {
     if (!info.sampledTextures.test(i)) {
@@ -1374,8 +1531,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     GXTexObj_ obj = g_gxState.loadedTextures[i];
     auto& textureBind = g_gxState.textures[i];
     const TextureResolveIdentity identity = make_texture_resolve_identity(obj);
-    // NSMBW debugging: NSMBW_NO_TEXMEMO resolves every sampled texture from scratch (no memo shortcuts).
-    static const bool noTexMemo = std::getenv("NSMBW_NO_TEXMEMO") != nullptr;
+    // Debugging: NO100F_NO_TEXMEMO resolves every sampled texture from scratch (no memo shortcuts).
+    static const bool noTexMemo = std::getenv("NO100F_NO_TEXMEMO") != nullptr;
     if (noTexMemo) {
       s_lastTextureResolveIdentityValid[i] = false;
       s_lastStaticSourceResolveKeyValid[i] = false;
@@ -1453,16 +1610,16 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
       handle = resolve_static_texture(obj);
     }
 
-    // NSMBW debugging: NSMBW_TEX_PROBE logs each texture (address, size, format) the first time it
+    // Debugging: NO100F_TEX_PROBE logs each texture (address, size, format) the first time it
     // resolves from a given source: an EFB copy or guest RAM (and which GPU texture).
-    static const bool texProbe = std::getenv("NSMBW_TEX_PROBE") != nullptr || std::filesystem::exists("texprobe.txt");
-    if (!handle && obj.data != nullptr && (++g_spmAudit[2], texProbe)) {
+    static const bool texProbe = std::getenv("NO100F_TEX_PROBE") != nullptr || std::filesystem::exists("texprobe.txt");
+    if (!handle && obj.data != nullptr && (++g_gxAudit[2], texProbe)) {
       static u32 misses = 0;
       if (misses++ < 200) std::fprintf(stderr, "[texprobe] NO HANDLE map %u tex %p %ux%u fmt %u\n", static_cast<unsigned>(i), obj.data, obj.width(), obj.height(), obj.format());
     }
     if (!handle) {  // audit: a used texture slot that resolved to nothing (null data, or palette format without a valid TLUT)
-      ++g_spmAudit[6];
-      if (is_palette_format(obj.format())) ++g_spmAudit[7];
+      ++g_gxAudit[6];
+      if (is_palette_format(obj.format())) ++g_gxAudit[7];
     }
     if (texProbe && handle) {
       static absl::flat_hash_set<std::pair<const void*, const void*>> seen;
@@ -1495,6 +1652,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
       s_lastStaticSourceNoCopyRevision[i] = 0;
     }
   }
+  log_highlight_draw_state(info);
+  log_texture_draw_states(info);
 }
 
 static inline wgpu::BlendFactor to_blend_factor(GXBlendFactor fac, bool isDst, bool alphaComponent) {
@@ -1573,6 +1732,42 @@ static inline wgpu::CompareFunction to_compare_function(GXCompare func) {
   case GX_ALWAYS:
     return wgpu::CompareFunction::Always;
   }
+}
+
+// Motion vectors: written by surfaces that own their pixel: color-writing draws that either write depth through a
+// real depth test, or are opaque without writing depth (sky, opaque HUD). Transparent effects that write no depth
+// leave the motion of what is behind them, and so do depth-only draws and the screen quad the game clears depth
+// with before its HUD (depth test "always"), which would otherwise give the whole scene the quad's motion.
+// Blending with source ONE and destination ZERO replaces the color: opaque, like no blending (the game clears with it).
+static bool motion_opaque(const PipelineConfig& config) noexcept {
+  return config.blendMode == GX_BM_NONE ||
+         (config.blendMode == GX_BM_BLEND && config.blendFacSrc == GX_BL_ONE && config.blendFacDst == GX_BL_ZERO);
+}
+static bool motion_owner(const PipelineConfig& config) noexcept {
+  return config.colorUpdate && (config.depthUpdate ? config.depthFunc != GX_ALWAYS : motion_opaque(config));
+}
+// An alpha-blended surface that writes depth (an occluder the game fades out in front of the camera, a shadow quad)
+// owns only the pixels where it is at least half opaque.
+static bool motion_alpha_blended(const PipelineConfig& config) noexcept {
+  return config.blendMode == GX_BM_BLEND && config.blendFacSrc == GX_BL_SRCALPHA;
+}
+// The draw's MotionRole (see gx.hpp).
+static u8 motion_role(const PipelineConfig& config, GXProjectionType projType) noexcept {
+  if (!config.colorUpdate) {
+    return MotionRoleOwner; // writes no color: nothing visible (it may not even own: see motion_owner)
+  }
+  if (projType == GX_ORTHOGRAPHIC) {
+    // A full-screen 2D quad writing depth with the test "always" is how the game clears the EFB at the start of a frame
+    // (and its depth before the HUD): a clear, not part of the 2D layer.
+    if (config.depthUpdate && config.depthFunc == GX_ALWAYS) {
+      return MotionRoleOwner;
+    }
+    return MotionRoleLayer2D;
+  }
+  if (motion_owner(config)) {
+    return motion_alpha_blended(config) ? MotionRoleAlphaOwned : MotionRoleOwner;
+  }
+  return motion_opaque(config) ? MotionRoleOwner : MotionRoleTransparent;
 }
 
 static inline wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac,
@@ -1741,15 +1936,55 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   };
   const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                          config.pixelFmt, config.dstAlpha);
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
-  }};
+  // Motion vectors (see motion_owner / motion_role). An alpha-owned surface's shader gives its motion alpha 0 or 1
+  // (at least half opaque), so motionSelect picks one of the two vectors, never a mix.
+  // 2D draws are not scene surfaces: the HUD has its mark, and a copy of the scene drawn back over it (the game's
+  // mist and glow effects paste part of the frame back) shows the scene, which keeps its own motion and depth.
+  const u8 role = config.shaderConfig.motionRole;
+  const bool writesMotion = motion_owner(config) && role != MotionRoleLayer2D;
+  const bool alphaOwned = motion_alpha_blended(config);
+  // The HUD mark: set by the draws the seal flags as the HUD, cleared under anything else drawn visibly (see the
+  // shader); weighted by the shader's alpha, like motionSelect.
+  const bool writesMark = role == MotionRoleLayer2D || writesMotion || role == MotionRoleTransparent;
+  constexpr wgpu::BlendState motionSelect{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::SrcAlpha,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  const std::array colorTargets{
+      wgpu::ColorTargetState{
+          .format = g_graphicsConfig.surfaceConfiguration.format,
+          .blend = &blendState,
+          .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
+      },
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::RG16Float,
+          .blend = writesMotion && alphaOwned ? &motionSelect : nullptr,
+          .writeMask =
+              writesMotion ? wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green : wgpu::ColorWriteMask::None,
+      },
+      // The owning surface's depth, under the same rules (an alpha-owned one needs a blendable 32-bit float target;
+      // without one it leaves the depth behind it).
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::R32Float,
+          .blend = writesMotion && alphaOwned && webgpu::g_float32Blendable ? &motionSelect : nullptr,
+          .writeMask = writesMotion && (!alphaOwned || webgpu::g_float32Blendable) ? wgpu::ColorWriteMask::Red
+                                                                                   : wgpu::ColorWriteMask::None,
+      },
+      // The HUD mark.
+      wgpu::ColorTargetState{
+          .format = wgpu::TextureFormat::R8Unorm,
+          .blend = alphaOwned || role == MotionRoleTransparent || role == MotionRoleLayer2D ? &motionSelect : nullptr,
+          .writeMask = writesMark ? wgpu::ColorWriteMask::Red : wgpu::ColorWriteMask::None,
+      },
+  };
   const wgpu::FragmentState fragmentState{
       .module = shader,
       .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
+      .targetCount = config.shaderConfig.motionVectors ? colorTargets.size() : 1,
       .targets = colorTargets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
@@ -1949,6 +2184,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.shaderConfig.tevStageCount = g_gxState.numTevStages;
   config.shaderConfig.numTexGens = g_gxState.numTexGens;
   config.shaderConfig.zFreeze = g_gxState.zFreeze && g_gxState.zFreezePlane.w() != 0.f;
+  config.shaderConfig.motionVectors = gfx::motion_vectors_active();
   if (g_gxState.zTextureOp != GX_ZT_DISABLE && !g_gxState.zCompLocBeforeTex) {
     config.shaderConfig.zTexture = (g_gxState.zTextureBias & 0x00FFFFFFu) |
                                     ((static_cast<u32>(g_gxState.zTextureFmt) & 0x3u) << 24) |
@@ -1991,12 +2227,77 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.pixelFmt = g_gxState.pixelFmt;
   config.dstAlpha = effective_dst_alpha(g_gxState.pixelFmt, g_gxState.alphaUpdate, g_gxState.dstAlpha);
   config.depthCompare = g_gxState.depthCompare;
-  // GX writes Z only when the Z test is on (Dolphin: "if the test is disabled write is disabled too"). Scooby-Doo!
-  // Unmasked's glow pass draws a full-screen quad with compare off and update on; writing its depth hid the floor,
-  // props and characters drawn earlier and let later draws show through walls.
+  // GX writes Z only when the Z test is on (Dolphin: "if the test is disabled write is disabled too").
   config.depthUpdate = g_gxState.depthCompare && g_gxState.depthUpdate;
   config.alphaUpdate = effective_alpha_update(g_gxState.pixelFmt, g_gxState.alphaUpdate);
   config.colorUpdate = g_gxState.colorUpdate;
+  config.shaderConfig.motionRole = config.shaderConfig.motionVectors ? motion_role(config, g_gxState.projType) : 0;
+}
+
+// Cut-outs: materials like leaves, grass and webs are drawn with alpha compare "alpha > 0" (or another low ref),
+// blending and depth write. Every pixel with any alpha writes depth, so:
+//  - an HD replacement's faint alpha round each shape hides whatever is drawn behind it later (a halo);
+//  - faint parts of the game's own soft textures do the same (the hub web's dark mesh over the pot);
+//  - the outline is wherever the magnified alpha first rises above 0: a hard edge on the texel grid.
+// CutoutMode::Cut raises the test to alpha > 127 for replacements (smooth outline, no halo, but soft textures lose
+// their faint parts). TwoPass draws the solid part (alpha > 127) with depth write, then the faint part (low ref <
+// alpha <= 127) blended without depth write, deferred until the solid scene behind it is drawn (the game draws
+// cut-outs early): faint pixels blend over what is really behind them and hide nothing. TwoPassAll (the default) does
+// that for original textures too (not like the console or Dolphin, which show the halos).
+constexpr u32 CutoutSolidRef = 127;
+static std::atomic<CutoutMode> s_cutoutMode{CutoutMode::TwoPassAll};  // set from the game thread (dev menu)
+
+void set_cutout_mode(CutoutMode mode) noexcept { s_cutoutMode.store(mode, std::memory_order_relaxed); }
+CutoutMode cutout_mode() noexcept { return s_cutoutMode.load(std::memory_order_relaxed); }
+
+static bool low_alpha_greater_test(const AlphaCompare& ac) noexcept {
+  const auto low = [](GXCompare comp, u32 ref) { return comp == GX_GREATER && ref < CutoutSolidRef; };
+  const auto ok = [&](GXCompare comp, u32 ref) { return comp == GX_ALWAYS || low(comp, ref); };
+  return ac.op == GX_AOP_AND && ok(ac.comp0, ac.ref0) && ok(ac.comp1, ac.ref1) &&
+         (low(ac.comp0, ac.ref0) || low(ac.comp1, ac.ref1));
+}
+
+bool cutout_state_active() noexcept {
+  return cutout_mode() != CutoutMode::Game && g_gxState.depthCompare && g_gxState.depthUpdate &&
+         low_alpha_greater_test(g_gxState.alphaCompare);
+}
+
+CutoutPasses cutout_passes(const ShaderInfo& info) noexcept {
+  if (!cutout_state_active()) {
+    return CutoutPasses::None;
+  }
+  bool sampled = false;
+  bool replacement = false;
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& tex = g_gxState.textures[i];
+    if (info.sampledTextures.test(i) && tex) {
+      sampled = true;
+      replacement = replacement || tex.ref->isReplacement;
+    }
+  }
+  switch (cutout_mode()) {
+  case CutoutMode::Cut:
+    return replacement ? CutoutPasses::Cut : CutoutPasses::None;
+  case CutoutMode::TwoPass:
+    return replacement ? CutoutPasses::TwoPass : CutoutPasses::None;
+  case CutoutMode::TwoPassAll:
+    return sampled ? CutoutPasses::TwoPass : CutoutPasses::None;
+  default:
+    return CutoutPasses::None;
+  }
+}
+
+void apply_cutout_solid(PipelineConfig& config) noexcept {
+  auto& ac = config.shaderConfig.alphaCompare;
+  if (ac.comp0 == GX_GREATER) ac.ref0 = std::max(ac.ref0, CutoutSolidRef);
+  if (ac.comp1 == GX_GREATER) ac.ref1 = std::max(ac.ref1, CutoutSolidRef);
+}
+
+void apply_cutout_fringe(PipelineConfig& config) noexcept {
+  auto& ac = config.shaderConfig.alphaCompare;
+  const u32 low = std::max(ac.comp0 == GX_GREATER ? ac.ref0 : 0u, ac.comp1 == GX_GREATER ? ac.ref1 : 0u);
+  ac = AlphaCompare{.comp0 = GX_GREATER, .ref0 = low, .op = GX_AOP_AND, .comp1 = GX_LEQUAL, .ref1 = CutoutSolidRef};
+  config.depthUpdate = false;
 }
 
 static TextureBindGroupCacheKey make_texture_bind_group_cache_key(const ShaderInfo& info) noexcept {

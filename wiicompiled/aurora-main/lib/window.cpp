@@ -6,6 +6,7 @@
 #endif
 #include "input.hpp"
 #include "internal.hpp"
+#include "monitor_labels.hpp"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
@@ -22,6 +23,7 @@
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_pixels.h>
+#include <SDL3/SDL_timer.h>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -35,13 +37,91 @@ extern "C" void Android_UnlockActivityMutex(void);
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include "dolphin/vi/vi_internal.hpp"
+#include <aurora/window_owner_sdl.hpp>
 
 namespace aurora::window {
+int hdr_display_state() {
+  if (window_owner::enabled() && !window_owner::is_owner())
+    return window_owner::call([] { return hdr_display_state(); });
+#if defined(_WIN32)
+  const auto display = SDL_GetDisplayForWindow(get_sdl_window());
+  static SDL_DisplayID cachedDisplay = 0;
+  static Uint64 checkedAt = 0;
+  static int cachedState = -1;
+  const auto now = SDL_GetTicks();
+  if (display == cachedDisplay && checkedAt != 0 && now - checkedAt < 500) return cachedState;
+  cachedDisplay = display;
+  checkedAt = now;
+  cachedState = -1;
+  const auto monitor = static_cast<HMONITOR>(SDL_GetPointerProperty(SDL_GetDisplayProperties(display),
+      SDL_PROP_DISPLAY_WINDOWS_HMONITOR_POINTER, nullptr));
+  MONITORINFOEXW monitorInfo{};
+  monitorInfo.cbSize = sizeof(monitorInfo);
+  if (!monitor || !GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&monitorInfo))) return cachedState;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) break;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    const auto result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
+    if (result == ERROR_INSUFFICIENT_BUFFER) continue;
+    if (result != ERROR_SUCCESS) break;
+    const DISPLAYCONFIG_PATH_INFO* match = nullptr;
+    for (UINT32 i = 0; i < pathCount; ++i) {
+      DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+      source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId,
+                       paths[i].sourceInfo.id};
+      if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) return cachedState;
+      if (wcscmp(source.viewGdiDeviceName, monitorInfo.szDevice) != 0) continue;
+      if (match != nullptr) return cachedState; // Mirrored outputs are ambiguous.
+      match = &paths[i];
+    }
+    if (match == nullptr) break;
+    // Local layout also builds against SDKs predating Windows 11's active-color-mode query.
+    struct AdvancedColor2 {
+      DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+      UINT32 flags, encoding, bitsPerChannel, activeMode;
+    } color{};
+    color.header = {static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(15), sizeof(color),
+                    match->targetInfo.adapterId, match->targetInfo.id};
+    auto error = DisplayConfigGetDeviceInfo(&color.header);
+    if (error == ERROR_SUCCESS) {
+      cachedState = (color.flags & 2) != 0 && color.activeMode == 2 ? 1 : 0;
+    } else if (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED) {
+      DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO legacy{};
+      legacy.header = {DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, sizeof(legacy),
+                       match->targetInfo.adapterId, match->targetInfo.id};
+      if (DisplayConfigGetDeviceInfo(&legacy.header) == ERROR_SUCCESS) {
+        if (!legacy.advancedColorEnabled) cachedState = 0;
+        // SDL confirms PQ output with headroom. Otherwise legacy ACM/HDR is ambiguous.
+        else if (SDL_GetBooleanProperty(SDL_GetWindowProperties(get_sdl_window()),
+                     SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false)) cachedState = 1;
+      }
+    }
+    break;
+  }
+  return cachedState;
+#else
+  return -1;
+#endif
+}
+
+std::string hdr_display_name() {
+  if (window_owner::enabled() && !window_owner::is_owner())
+    return window_owner::call([] { return hdr_display_name(); });
+  const char* name = SDL_GetDisplayName(SDL_GetDisplayForWindow(get_sdl_window()));
+  return name != nullptr ? name : "Unknown display";
+}
+
 namespace {
 Module Log("aurora::window");
 
@@ -60,6 +140,11 @@ std::vector<AuroraEvent> g_events;
 std::atomic_bool g_backgrounded = false;
 std::atomic_bool g_nativeResizePending = false;
 std::atomic<AuroraDisplayMode> g_displayMode{AURORA_DISPLAY_MODE_WINDOWED};
+// Window owner thread only. The monitor id for fullscreen; empty or "auto" = the monitor the window is on.
+std::string g_fullscreenMonitor;
+// Where the window was before borderless fullscreen moved it to that monitor: put back on leaving fullscreen, so the
+// player's window spot (window_x/y) is not overwritten.
+std::optional<std::pair<int, int>> g_windowPosBeforeFullscreen;
 #if defined(SDL_PLATFORM_ANDROID)
 std::atomic_bool g_surfaceReady = false;
 #else
@@ -102,7 +187,14 @@ LRESULT CALLBACK aurora_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
   if (g_prevWindowProc == nullptr) {
     return DefWindowProc(hwnd, msg, wparam, lparam);
   }
-  return CallWindowProc(g_prevWindowProc, hwnd, msg, wparam, lparam);
+  const auto result = CallWindowProc(g_prevWindowProc, hwnd, msg, wparam, lparam);
+  // SDL_PumpEvents stays inside Windows' move/size and menu loops. Publish after SDL has
+  // handled each native message, not only after the outer pump eventually returns.
+  if (sizeChanged || msg == WM_MOVE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS ||
+      msg == WM_SHOWWINDOW || msg == WM_DPICHANGED) {
+    window_owner::refresh_window_state();
+  }
+  return result;
 }
 
 void install_window_proc_hook() noexcept {
@@ -234,7 +326,7 @@ bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
   case SDL_EVENT_WINDOW_RESTORED:
     g_backgrounded.store(false, std::memory_order_relaxed);
     break;
-  // NSMBW: a phone app is killed, never shut down, so the pipelines compiled while playing are
+  // A phone app is killed, never shut down, so the pipelines compiled while playing are
   // saved for the next launch when it leaves the screen (Dawn's device is internally locked).
   case SDL_EVENT_WILL_ENTER_BACKGROUND:
   case SDL_EVENT_TERMINATING:
@@ -378,7 +470,13 @@ const AuroraEvent* poll_events() {
   return g_events.data();
 }
 
+static SDL_DisplayID fullscreen_target_display();
+
 bool create_window(AuroraBackend backend) {
+  if (window_owner::enabled() && !window_owner::is_owner())
+    return window_owner::call([=] { return create_window(backend); });
+  if (window_owner::enabled() && (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES))
+    throw std::runtime_error("Window owner does not support SDL OpenGL contexts");
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
@@ -423,8 +521,17 @@ bool create_window(AuroraBackend backend) {
     height = 480;
   }
 
-  const Sint32 posX = g_config.hasWindowPosition ? g_config.windowPosX : SDL_WINDOWPOS_CENTERED;
-  const Sint32 posY = g_config.hasWindowPosition ? g_config.windowPosY : SDL_WINDOWPOS_CENTERED;
+  Sint32 posX = g_config.hasWindowPosition ? g_config.windowPosX : SDL_WINDOWPOS_CENTERED;
+  Sint32 posY = g_config.hasWindowPosition ? g_config.windowPosY : SDL_WINDOWPOS_CENTERED;
+  // Starting fullscreen on a chosen monitor: open there, so the window never shows on another monitor on its way.
+  if (const SDL_DisplayID target = fullscreen_target_display(); target != 0) {
+    // Without a saved spot the window's home is the centre of the main monitor, as when it opens in a window.
+    const Sint32 mainCentered = SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetPrimaryDisplay());
+    g_windowPosBeforeFullscreen = {g_config.hasWindowPosition ? posX : mainCentered,
+                                   g_config.hasWindowPosition ? posY : mainCentered};
+    posX = SDL_WINDOWPOS_CENTERED_DISPLAY(target);
+    posY = SDL_WINDOWPOS_CENTERED_DISPLAY(target);
+  }
 
   const auto props = SDL_CreateProperties();
   TRY(SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, g_config.appName), "Failed to set {}: {}",
@@ -455,6 +562,8 @@ bool create_window(AuroraBackend backend) {
 }
 
 bool create_renderer() {
+  if (window_owner::enabled())
+    throw std::runtime_error("Window owner requires WebGPU, not the SDL renderer fallback");
   if (g_window == nullptr) {
     return false;
   }
@@ -473,6 +582,10 @@ bool create_renderer() {
 }
 
 void destroy_window() {
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    window_owner::call([] { destroy_window(); });
+    return;
+  }
 #if defined(_WIN32)
   uninstall_window_proc_hook();
 #endif
@@ -493,6 +606,8 @@ void show_window() {
 }
 
 bool initialize() {
+  if (window_owner::enabled() && !window_owner::is_owner())
+    return window_owner::call([] { return initialize(); });
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
@@ -517,15 +632,21 @@ bool initialize() {
 }
 
 bool initialize_event_watch() {
+  if (window_owner::enabled() && !window_owner::is_owner())
+    return window_owner::call([] { return initialize_event_watch(); });
   TRY(SDL_AddEventWatch(lifecycle_event_watch, nullptr), "Error adding SDL event watch: {}", SDL_GetError());
   return true;
 }
 
 void shutdown() {
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    window_owner::call([] { shutdown(); });
+    return;
+  }
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
   TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
-  SDL_Quit();
+  if (!window_owner::enabled()) SDL_Quit();
 }
 
 AuroraWindowSize get_window_size() {
@@ -533,9 +654,20 @@ AuroraWindowSize get_window_size() {
   int height = 0;
   int native_fb_w = 0;
   int native_fb_h = 0;
-  ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
-  ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
-         SDL_GetError());
+  float scale = 1.f;
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    const auto state = window_owner::native_state();
+    width = state.width;
+    height = state.height;
+    native_fb_w = state.pixelsWidth;
+    native_fb_h = state.pixelsHeight;
+    scale = state.scale;
+  } else {
+    ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
+    ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
+           SDL_GetError());
+    scale = SDL_GetWindowDisplayScale(g_window);
+  }
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
@@ -592,7 +724,6 @@ AuroraWindowSize get_window_size() {
     fb_h = scaledH;
   }
 
-  const float scale = SDL_GetWindowDisplayScale(g_window);
   return {
       .width = static_cast<uint32_t>(width),
       .height = static_cast<uint32_t>(height),
@@ -629,7 +760,7 @@ bool is_presentable() noexcept {
          g_surfaceReady.load(std::memory_order_acquire);
 }
 
-void pump_events() noexcept {
+void pump_events() {
   if (g_window != nullptr) {
     SDL_SyncWindow(g_window);
   }
@@ -680,7 +811,149 @@ void set_fullscreen(bool fullscreen) {
 
 bool get_fullscreen() { return (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) != 0u; }
 
+#if defined(_WIN32)
+namespace {
+struct NativeMonitor {
+  std::string id;
+  std::string name;
+  SDL_DisplayID display = 0;
+  RECT bounds{};
+  bool primary = false;
+};
+
+std::string utf8_from_wide(const wchar_t* text) {
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 1) {
+    return {};
+  }
+  std::string result(static_cast<size_t>(size - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+  return result;
+}
+
+// "\\?\DISPLAY#ACI2498#5&2d9ad897&0&UID4353#{guid}" -> "ACI2498/5&2d9ad897&0&UID4353": the model, then the instance
+// (tells identical monitors apart). The launcher makes the same ids (Monitors.cs); it can't read a '#' in a config value.
+std::string monitor_id_from_path(const std::string& path) {
+  const size_t model = path.find('#');
+  const size_t instance = model == std::string::npos ? model : path.find('#', model + 1);
+  const size_t end = instance == std::string::npos ? instance : path.find('#', instance + 1);
+  if (end == std::string::npos) {
+    return {};
+  }
+  return path.substr(model + 1, instance - model - 1) + '/' + path.substr(instance + 1, end - instance - 1);
+}
+
+std::vector<NativeMonitor> query_monitors() {
+  std::vector<NativeMonitor> monitors;
+  std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+  std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+  UINT32 pathCount = 0;
+  UINT32 modeCount = 0;
+  LONG result = ERROR_SUCCESS;
+  do {
+    result = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount);
+    if (result != ERROR_SUCCESS) {
+      return monitors;
+    }
+    paths.resize(pathCount);
+    modes.resize(modeCount);
+    result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
+  } while (result == ERROR_INSUFFICIENT_BUFFER);
+  if (result != ERROR_SUCCESS) {
+    return monitors;
+  }
+
+  int displayCount = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&displayCount);
+  for (int i = 0; displays != nullptr && i < displayCount; ++i) {
+    const auto monitorHandle = static_cast<HMONITOR>(SDL_GetPointerProperty(
+        SDL_GetDisplayProperties(displays[i]), SDL_PROP_DISPLAY_WINDOWS_HMONITOR_POINTER, nullptr));
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (monitorHandle == nullptr || !GetMonitorInfoW(monitorHandle, &info)) {
+      continue;
+    }
+    for (UINT32 p = 0; p < pathCount; ++p) {
+      DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+      source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+      source.header.size = sizeof(source);
+      source.header.adapterId = paths[p].sourceInfo.adapterId;
+      source.header.id = paths[p].sourceInfo.id;
+      if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+          wcscmp(source.viewGdiDeviceName, info.szDevice) != 0) {
+        continue;
+      }
+      DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+      target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+      target.header.size = sizeof(target);
+      target.header.adapterId = paths[p].targetInfo.adapterId;
+      target.header.id = paths[p].targetInfo.id;
+      if (DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS) {
+        std::string id = monitor_id_from_path(utf8_from_wide(target.monitorDevicePath));
+        if (!id.empty()) {
+          std::string name = utf8_from_wide(target.monitorFriendlyDeviceName);
+          monitors.push_back({.id = std::move(id),
+                              .name = name.empty() ? "Monitor" : std::move(name),
+                              .display = displays[i],
+                              .bounds = info.rcMonitor,
+                              .primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+        }
+      }
+      break;  // mirrored monitors share one desktop: the first stands for them
+    }
+  }
+  SDL_free(displays);
+  return monitors;
+}
+
+// What a saved id means now: that monitor, else the only connected one of its model (plugged into another port).
+const NativeMonitor* find_monitor(const std::vector<NativeMonitor>& monitors, std::string_view id) {
+  for (const auto& monitor : monitors) {
+    if (monitor.id == id) {
+      return &monitor;
+    }
+  }
+  const size_t modelEnd = id.find('/');
+  if (modelEnd == std::string_view::npos) {
+    return nullptr;
+  }
+  const std::string_view model = id.substr(0, modelEnd + 1);
+  const NativeMonitor* found = nullptr;
+  for (const auto& monitor : monitors) {
+    if (monitor.id.starts_with(model)) {
+      if (found != nullptr) {
+        return nullptr;
+      }
+      found = &monitor;
+    }
+  }
+  return found;
+}
+} // namespace
+#endif
+
+// The display fullscreen must go to; 0 = wherever the window is.
+static SDL_DisplayID fullscreen_target_display() {
+  if (g_fullscreenMonitor.empty() || g_fullscreenMonitor == "auto") {
+    return 0;
+  }
+#if defined(_WIN32)
+  const auto monitors = query_monitors();
+  if (const NativeMonitor* monitor = find_monitor(monitors, g_fullscreenMonitor)) {
+    return monitor->display;
+  }
+  Log.warn("Fullscreen monitor {} is not connected: using the main monitor", g_fullscreenMonitor);
+  return SDL_GetPrimaryDisplay();
+#else
+  return 0;
+#endif
+}
+
 void set_display_mode(AuroraDisplayMode mode) {
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    window_owner::submit([=] { set_display_mode(mode); }, 20);
+    return;
+  }
   if (g_window == nullptr) {
     return;
   }
@@ -695,11 +968,18 @@ void set_display_mode(AuroraDisplayMode mode) {
     return;
   }
 
+  // Native messages can be published to the guest before the SDL call returns.
+  // Do not persist fullscreen dimensions as the player's windowed placement.
+  g_displayMode.store(mode, std::memory_order_release);
   bool success = true;
   if (mode == AURORA_DISPLAY_MODE_WINDOWED) {
     success = SDL_SetWindowFullscreen(g_window, false);
     if (success) {
       success = SDL_SetWindowFullscreenMode(g_window, nullptr);
+    }
+    if (success && g_windowPosBeforeFullscreen) {
+      success = SDL_SetWindowPosition(g_window, g_windowPosBeforeFullscreen->first, g_windowPosBeforeFullscreen->second);
+      g_windowPosBeforeFullscreen.reset();
     }
   } else if (mode == AURORA_DISPLAY_MODE_BORDERLESS) {
     if (SDL_GetWindowFullscreenMode(g_window) != nullptr) {
@@ -709,22 +989,37 @@ void set_display_mode(AuroraDisplayMode mode) {
       success = SDL_SetWindowFullscreenMode(g_window, nullptr);
     }
     if (success) {
+      // Borderless has no mode to carry a monitor: it goes to the monitor the window is on.
+      const SDL_DisplayID target = fullscreen_target_display();
+      if (target != 0 && target != SDL_GetDisplayForWindow(g_window)) {
+        int x = 0;
+        int y = 0;
+        if (!g_windowPosBeforeFullscreen && SDL_GetWindowPosition(g_window, &x, &y)) {
+          g_windowPosBeforeFullscreen = {x, y};
+        }
+        success = SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED_DISPLAY(target),
+                                        SDL_WINDOWPOS_CENTERED_DISPLAY(target));
+      }
+    }
+    if (success) {
       success = SDL_SetWindowFullscreen(g_window, true);
     }
   } else {
-    const SDL_DisplayID display = SDL_GetDisplayForWindow(g_window);
+    const SDL_DisplayID target = fullscreen_target_display();
+    const SDL_DisplayID display = target != 0 ? target : SDL_GetDisplayForWindow(g_window);
     const SDL_DisplayMode* desktop = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
     const uint32_t interpolationFps = aurora_get_frame_interpolation_fps();
     const float targetHz = interpolationFps > 60 ? static_cast<float>(interpolationFps) : 60.0f;
     SDL_DisplayMode closest{};
     if (desktop == nullptr ||
         !SDL_GetClosestFullscreenDisplayMode(display, desktop->w, desktop->h, targetHz, true, &closest)) {
+      g_displayMode.store(currentMode, std::memory_order_release);
       Log.warn("No exclusive fullscreen mode near {:.0f} Hz is available: {}", targetHz, SDL_GetError());
       return;
     }
     const SDL_DisplayMode* active = SDL_GetWindowFullscreenMode(g_window);
-    if (mode == currentMode && active != nullptr && active->w == closest.w && active->h == closest.h &&
-        active->refresh_rate == closest.refresh_rate) {
+    if (mode == currentMode && active != nullptr && active->displayID == closest.displayID &&
+        active->w == closest.w && active->h == closest.h && active->refresh_rate == closest.refresh_rate) {
       return;
     }
     if (get_fullscreen() && mode != currentMode) {
@@ -742,16 +1037,58 @@ void set_display_mode(AuroraDisplayMode mode) {
   }
 
   if (!success) {
+    g_displayMode.store(currentMode, std::memory_order_release);
     Log.warn("Failed to change display mode: {}", SDL_GetError());
     return;
   }
-  g_displayMode.store(mode, std::memory_order_release);
   g_nativeResizePending.store(true, std::memory_order_release);
   TRY_WARN(push_custom_event(CustomEvent::FutureResize), "Failed to queue fullscreen resize event: {}",
            SDL_GetError());
 }
 
 AuroraDisplayMode get_display_mode() { return g_displayMode.load(std::memory_order_acquire); }
+
+uint32_t get_monitors(AuroraMonitor* monitors, uint32_t maxCount) {
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    return window_owner::call([=] { return get_monitors(monitors, maxCount); });
+  }
+#if defined(_WIN32)
+  const auto found = query_monitors();
+  const NativeMonitor* selected = find_monitor(found, g_fullscreenMonitor);
+  std::vector<MonitorLabelInput> inputs;
+  for (const auto& monitor : found) {
+    const RECT& r = monitor.bounds;
+    inputs.push_back({monitor.name, r.left, r.top, r.right, r.bottom, monitor.primary});
+  }
+  const std::vector<std::string> labels = monitor_labels(inputs);
+  uint32_t count = 0;
+  for (size_t i = 0; i < found.size() && count < maxCount; ++i) {
+    AuroraMonitor& out = monitors[count++];
+    std::snprintf(out.id, sizeof(out.id), "%s", found[i].id.c_str());
+    std::snprintf(out.label, sizeof(out.label), "%s", labels[i].c_str());
+    out.selected = &found[i] == selected;
+  }
+  return count;
+#else
+  (void)monitors;
+  (void)maxCount;
+  return 0;
+#endif
+}
+
+void set_fullscreen_monitor(const char* id) {
+  if (window_owner::enabled() && !window_owner::is_owner()) {
+    const std::string copy(id != nullptr ? id : "");
+    window_owner::call([=] { set_fullscreen_monitor(copy.c_str()); });
+    return;
+  }
+  g_fullscreenMonitor = id != nullptr ? id : "";
+  const AuroraDisplayMode mode = g_displayMode.load(std::memory_order_acquire);
+  if (g_window != nullptr && mode != AURORA_DISPLAY_MODE_WINDOWED) {
+    set_display_mode(AURORA_DISPLAY_MODE_WINDOWED);
+    set_display_mode(mode);
+  }
+}
 
 void set_window_size(uint32_t width, uint32_t height) {
   TRY_WARN(SDL_RestoreWindow(g_window), "Failed to un-maximize window: {}", SDL_GetError());

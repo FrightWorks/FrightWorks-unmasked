@@ -472,9 +472,10 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void clear_copy_texture_cache() noexcept;
 void clear_display_copy_cache() noexcept;
-void set_display_copy_present_source() noexcept;
+// `efbRect`: the render-target rectangle the display copy was made from (see webgpu::PresentSource::efbRect).
+void set_display_copy_present_source(std::array<float, 4> efbRect = {}) noexcept;
 void evict_copy_texture(const void* dest) noexcept;
-// NSMBW: the cached static textures whose RAM holds `dest` (a copy patching part of a texture).
+// The cached static textures whose RAM holds `dest` (a copy patching part of a texture).
 struct PatchTarget {
   gfx::TextureHandle texture;
   u32 x = 0, y = 0;
@@ -570,7 +571,8 @@ struct ShaderConfig {
   u8 dualTexEnabled : 1 = 0;
   u8 fogRangeAdjust : 1 = 0;
   u8 zFreeze : 1 = 0; // GX coplanar mode (genMode bit 19): depth comes from the reference plane
-  u8 pad1 : 3 = 0;
+  u8 motionVectors : 1 = 0; // the pass has a motion-vector target (location 1); see gfx::motion_vectors_active
+  u8 motionRole : 2 = 0;    // how the draw writes the HUD mark (MotionRole), with motionVectors
   u8 numTexGens = 0;
   u32 zTexture = 0; // bias[0:23], format[24:25], op[26:27]; 0 disables shader depth output.
   std::array<AttrConfig, MaxVtxAttr> attrs;
@@ -696,7 +698,8 @@ inline TevStageTextureDependency tev_stage_texture_dependency(const ShaderConfig
       .needsFixedTexcoordState = tev_stage_needs_fixed_texcoord_state(config, stageIdx),
       .combinerUsesTexture = tev_stage_combiner_uses_texture(stage),
   };
-  dependency.canSampleTexture = dependency.texCoordId >= 0 && dependency.texMapId >= 0;
+  // With no texgens GX still samples the stage's texture, at coordinate 0 (Dolphin does the same).
+  dependency.canSampleTexture = dependency.texMapId >= 0 && (dependency.texCoordId >= 0 || config.numTexGens == 0);
   return dependency;
 }
 
@@ -751,6 +754,14 @@ struct UniformMatrixLayout {
   bool absolutePosRegion = false;
 };
 // Output info from shader generation
+// Motion vectors: how a draw writes them and the HUD mark (gx.cpp motion_role). Only surfaces that own their pixels
+// write motion and depth; transparent effects leave the motion of what is behind them.
+enum MotionRole : u8 {
+  MotionRoleOwner = 0,       // owns its pixels (if it writes motion at all: see motion_owner)
+  MotionRoleTransparent = 1, // blended effect (particles, glows, fog, shadows, cut-out fringes): writes no motion
+  MotionRoleAlphaOwned = 2,  // alpha-blended surface writing depth: owns where >= 50% opaque, transparent elsewhere
+  MotionRoleLayer2D = 3,     // 2D (orthographic): the HUD marks its pixels, anything else clears the mark under it
+};
 struct ShaderInfo {
   std::bitset<MaxTexCoord> sampledTexCoords;
   std::bitset<MaxTextures> sampledTextures;
@@ -771,12 +782,26 @@ struct ShaderInfo {
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   bool zFreeze : 1 = false;
+  // Motion vectors: last frame's viewport, projection and position matrices follow everything else
+  // in the uniform block (filled at frame seal by frame interpolation's draw pairing).
+  bool motionPrev : 1 = false;
+  u32 motionPrevOffset = 0;
   u8 lineMode : 2 = 0;
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+// Cut-out draws ("alpha > low ref" + depth write), see gx.cpp. cutout_state_active: the GX state alone qualifies (before
+// the textures are known); cutout_passes: the passes this draw needs once its textures are resolved.
+enum class CutoutMode : u8 { Game, Cut, TwoPass, TwoPassAll };
+enum class CutoutPasses : u8 { None, Cut, TwoPass };
+void set_cutout_mode(CutoutMode mode) noexcept;
+CutoutMode cutout_mode() noexcept;
+bool cutout_state_active() noexcept;
+CutoutPasses cutout_passes(const ShaderInfo& info) noexcept;
+void apply_cutout_solid(PipelineConfig& config) noexcept;
+void apply_cutout_fringe(PipelineConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;

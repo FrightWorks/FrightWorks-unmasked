@@ -3,6 +3,9 @@
 #include "../gx/shader_info.hpp"
 
 #include "clear.hpp"
+#include "motion_effects.hpp"
+#include "bloom.hpp"
+#include "scene_stage.hpp"
 #include "depth_peek.hpp"
 #include "efb_ram_copy.hpp"
 #include "../internal.hpp"
@@ -154,6 +157,9 @@ uint32_t g_mergedDrawCallCount = 0;
 using CommandList = std::vector<Command>;
 struct RenderPass {
   wgpu::TextureView colorView;
+  wgpu::TextureView motionView;      // motion vectors (location 1), when motion_vectors_active()
+  wgpu::TextureView motionDepthView; // their surfaces' depth (location 2)
+  wgpu::TextureView motionMarkView;  // the HUD mark (location 3)
   wgpu::TextureView resolveView; // MSAA resolve target; null if msaaSamples == 1
   wgpu::TextureView depthView;
   wgpu::Texture copySourceTexture;
@@ -178,11 +184,31 @@ struct RenderPass {
   // failing every subsequent depth test and making whatever's drawn into it vanish).
   float clearDepthValue = gx::UseReversedZ ? 0.f : 1.f;
   CommandList commands;
+  // Solid scene, cut-out fringes, then translucent world draws. Explicit barriers flush both tails.
+  CommandList deferred;
+  CommandList translucent;
+  // A solid surface's second layer is in `deferred`: it was in the see-through tail until the scene stage moved it, so
+  // it still counts as the tail having started.
+  bool surfaceLayerPending = false;
+  std::optional<Viewport> deferredViewport;
+  std::optional<Viewport> translucentViewport;
+  std::optional<ClipRect> deferredScissor;
+  std::optional<ClipRect> translucentScissor;
   bool clearColor = true;
   bool clearDepth = true;
+  // Motion vectors start each frame at zero: set on a new frame's first EFB pass only, so the passes that continue
+  // a frame split by a mid-frame submit (or a later EFB pass) keep the motion drawn before them.
+  bool clearMotion = false;
   // The resolve destination outlives the frame with no re-issue path (one-shot
   // bake), so this pass may not drop draws even in skip-unready-pipelines mode.
   bool requireReadyPipelines = false;
+  // The scene stage (scene_stage.hpp) runs before this pass: it continues the pass before it after the solid scene,
+  // and starts with the see-through tail. `sceneCamera` is the solid scene's camera then.
+  bool sceneStageBefore = false;
+  scene_stage::Camera sceneCamera{};
+  // The point after the see-through tail runs before this pass (bloom.hpp): it continues the pass after the tail and
+  // starts with what the frame draws next (its HUD). Made with the scene stage's pass when the bloom wants it.
+  bool afterTailBefore = false;
   bool resolveHalfScale = false;
   bool resolveCopyFilterActive = false;
   bool resolveForceOpaqueAlpha = false;
@@ -191,7 +217,7 @@ struct RenderPass {
   bool resolveLinearSampling = false;
   bool snapshotColorResolveSource = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
-  // NSMBW: copies of this pass's resolve target into a region of another texture (add_resolve_patch).
+  // Copies of this pass's resolve target into a region of another texture (add_resolve_patch).
   struct Patch {
     TextureHandle dst;
     TextureHandle native;  // the resolve target scaled to the patch's own size
@@ -235,7 +261,11 @@ static void release_command_list(CommandList&& list) noexcept {
   g_commandListPool.emplace_back(std::move(list));
 }
 
-static void release_render_pass(RenderPass& pass) noexcept { release_command_list(std::move(pass.commands)); }
+static void release_render_pass(RenderPass& pass) noexcept {
+  release_command_list(std::move(pass.commands));
+  release_command_list(std::move(pass.deferred));
+  release_command_list(std::move(pass.translucent));
+}
 
 static void recycle_render_passes(std::vector<RenderPass>& passes) noexcept {
   for (auto& pass : passes) {
@@ -248,6 +278,7 @@ struct SealedFrameData {
   depth_peek::FrameMapping depthMapping;
   DebugFrameData debug;
   std::vector<RenderPass> passes;
+  std::optional<MotionTargets> motion; // the EFB motion targets, when the frame was drawn with motion vectors
 };
 
 SealedFrame::SealedFrame() : m_data(std::make_unique<SealedFrameData>()) {}
@@ -324,6 +355,9 @@ static void discard_suspended_efb_pass() noexcept {
 static bool has_current_render_pass() noexcept { return g_currentRenderPass < g_renderPasses.size(); }
 static webgpu::TextureWithSampler g_offscreenColor;
 static webgpu::TextureWithSampler g_offscreenDepth;
+static webgpu::TextureWithSampler g_offscreenMotion;
+static webgpu::TextureWithSampler g_offscreenMotionDepth;
+static webgpu::TextureWithSampler g_offscreenMotionMark;
 
 struct ResolveSourceSnapshotPool {
   TextureHandle entry;
@@ -415,7 +449,7 @@ static ClipRect calculate_resolve_snapshot_rect(const wgpu::Extent3D& targetSize
       .height = static_cast<int32_t>(targetSize.height),
   };
   // Shader-sampled and converted copies can feed effects that read outside the copy rectangle
-  // (MKW's DOF chain), so keep those full-target. Exact copies have a closed, crop-safe footprint.
+  // (a depth of field chain, say), so keep those full-target. Exact copies have a closed, crop-safe footprint.
   if (samplingPlan.needsConversion ||
       samplingPlan.needsShaderSampling ||
       targetSize.width == 0 || targetSize.height == 0 ||
@@ -447,6 +481,9 @@ static ClipRect calculate_resolve_snapshot_rect(const wgpu::Extent3D& targetSize
 
 static void set_efb_targets(RenderPass& pass) {
   pass.colorView = webgpu::g_frameBuffer.view;
+  pass.motionView = webgpu::g_motionVectors.view;
+  pass.motionDepthView = webgpu::g_motionDepth.view;
+  pass.motionMarkView = webgpu::g_motionMark.view;
   pass.resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : nullptr;
   pass.depthView = webgpu::g_depthBuffer.view;
   pass.copySourceTexture =
@@ -471,6 +508,9 @@ struct OffscreenCacheKey {
 struct OffscreenCacheEntry {
   webgpu::TextureWithSampler color;
   webgpu::TextureWithSampler depth;
+  webgpu::TextureWithSampler motion; // only when motion_vectors_active(); never read back
+  webgpu::TextureWithSampler motionDepth;
+  webgpu::TextureWithSampler motionMark;
 };
 static absl::flat_hash_map<OffscreenCacheKey, OffscreenCacheEntry> g_offscreenCache;
 std::vector<TextureUpload> g_textureUploads;
@@ -507,6 +547,119 @@ static void push_draw_command(ShaderDrawCommand data) {
   ++g_drawCallCount;
 }
 
+static Viewport g_cachedViewport;
+static ClipRect g_cachedScissor;
+
+void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind kind) {
+  if (!has_current_render_pass())
+    UNLIKELY { return; }
+  auto& pass = g_renderPasses[g_currentRenderPass];
+  auto& list = kind == DeferredDrawKind::Translucent ? pass.translucent : pass.deferred;
+  pass.surfaceLayerPending |= kind == DeferredDrawKind::SurfaceLayer;
+  // Each deferred draw carries the viewport and scissor it was recorded with.
+  auto& lastViewport = kind == DeferredDrawKind::Translucent ? pass.translucentViewport : pass.deferredViewport;
+  auto& lastScissor = kind == DeferredDrawKind::Translucent ? pass.translucentScissor : pass.deferredScissor;
+  if (!lastViewport || *lastViewport != g_cachedViewport) {
+    list.push_back({.type = CommandType::SetViewport, .data = Command::Data{.setViewport = g_cachedViewport}});
+    lastViewport = g_cachedViewport;
+  }
+  if (!lastScissor || *lastScissor != g_cachedScissor) {
+    list.push_back({.type = CommandType::SetScissor, .data = Command::Data{.setScissor = g_cachedScissor}});
+    lastScissor = g_cachedScissor;
+  }
+  list.push_back({
+      .type = CommandType::Draw,
+#ifdef AURORA_GFX_DEBUG_GROUPS
+      .debugGroupStack = g_debugFrame.groups,
+#endif
+      .data = Command::Data{.draw = ShaderDrawCommand{.type = ShaderType::GX, .gx = data}},
+  });
+  ++g_drawCallCount;
+}
+
+static void sort_particle_draws(CommandList& commands) {
+  const auto sortGroup = [](const Command& command) -> HashType {
+    if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GX) return 0;
+    return command.data.draw.gx.particleSortGroup;
+  };
+  for (auto first = commands.begin(); first != commands.end();) {
+    const auto group = sortGroup(*first);
+    if (group == 0) {
+      ++first;
+      continue;
+    }
+    auto last = std::find_if(std::next(first), commands.end(),
+                            [&](const Command& command) { return sortGroup(command) != group; });
+    std::stable_sort(first, last, [](const Command& left, const Command& right) {
+      return left.data.draw.gx.particleDepth > right.data.draw.gx.particleDepth;
+    });
+    first = last;
+  }
+}
+
+void flush_deferred_draws() {
+  if (!has_current_render_pass()) return;
+  auto& pass = g_renderPasses[g_currentRenderPass];
+  if (pass.deferred.empty() && pass.translucent.empty()) return;
+  sort_particle_draws(pass.translucent);
+  pass.commands.insert(pass.commands.end(), pass.deferred.begin(), pass.deferred.end());
+  pass.deferred.clear();
+  pass.surfaceLayerPending = false;
+  pass.deferredViewport.reset();
+  pass.deferredScissor.reset();
+  if (!g_inOffscreen && scene_stage::wanted()) {
+    // The solid scene, its cut-out fringes and its surfaces' second layers are drawn: the scene stage runs here, so
+    // the see-through tail goes into a new pass that keeps the colour and depth (its draws carry their own viewport
+    // and scissor).
+    RenderPass continuation{
+        .colorView = pass.colorView,
+        .motionView = pass.motionView,
+        .motionDepthView = pass.motionDepthView,
+        .motionMarkView = pass.motionMarkView,
+        .resolveView = pass.resolveView,
+        .depthView = pass.depthView,
+        .copySourceTexture = pass.copySourceTexture,
+        .copySourceView = pass.copySourceView,
+        .copySourceDepthView = pass.copySourceDepthView,
+        .targetSize = pass.targetSize,
+        .msaaSamples = pass.msaaSamples,
+        .clearColor = false,
+        .clearDepth = false,
+        .requireReadyPipelines = pass.requireReadyPipelines,
+        .sceneStageBefore = true,
+        .sceneCamera = scene_stage::camera(),
+    };
+    CommandList translucent = std::move(pass.translucent);
+    pass.translucent.clear();
+    pass.translucentViewport.reset();
+    pass.translucentScissor.reset();
+    auto afterTail = continuation;
+    auto& next = push_render_pass(std::move(continuation)); // `pass` is invalid from here
+    next.commands.insert(next.commands.end(), translucent.begin(), translucent.end());
+    ++g_currentRenderPass;
+    if (bloom::wanted()) {
+      // And after the tail: what the frame draws next (its HUD) goes into another pass.
+      afterTail.sceneStageBefore = false;
+      afterTail.afterTailBefore = true;
+      push_render_pass(std::move(afterTail));
+      ++g_currentRenderPass;
+    }
+  } else {
+    pass.commands.insert(pass.commands.end(), pass.translucent.begin(), pass.translucent.end());
+    pass.translucent.clear();
+    pass.translucentViewport.reset();
+    pass.translucentScissor.reset();
+  }
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
+}
+
+bool has_pending_translucent_draws() noexcept {
+  if (!has_current_render_pass()) return false;
+  const auto& pass = g_renderPasses[g_currentRenderPass];
+  return !pass.translucent.empty() || pass.surfaceLayerPending;
+}
+
 Vec2<uint32_t> get_frame_buffer_size() noexcept {
   if (webgpu::g_frameBuffer.size.width != 0 && webgpu::g_frameBuffer.size.height != 0) {
     return {webgpu::g_frameBuffer.size.width, webgpu::g_frameBuffer.size.height};
@@ -525,7 +678,6 @@ Vec2<uint32_t> get_render_target_size() noexcept {
   return get_frame_buffer_size();
 }
 
-static Viewport g_cachedViewport;
 void set_viewport(const Viewport& cmd) noexcept {
   if (cmd != g_cachedViewport) {
     push_command(CommandType::SetViewport, Command::Data{.setViewport = cmd});
@@ -533,7 +685,6 @@ void set_viewport(const Viewport& cmd) noexcept {
   }
 }
 
-static ClipRect g_cachedScissor;
 void set_scissor(const ClipRect& cmd) noexcept {
   if (cmd != g_cachedScissor) {
     push_command(CommandType::SetScissor, Command::Data{.setScissor = cmd});
@@ -543,6 +694,7 @@ void set_scissor(const ClipRect& cmd) noexcept {
 
 template <>
 void push_draw_command(clear::DrawData data) {
+  flush_deferred_draws();
   if (data.uniformRange.size == 0) {
     ensure_staging_space({0, staging_uniform_bytes(16), 0, 0});
     const std::array clearUniform{
@@ -557,7 +709,9 @@ void push_draw_command(clear::DrawData data) {
 }
 
 template <>
-PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
+PipelineRef pipeline_ref(const clear::PipelineConfig& requested) {
+  auto config = requested;
+  config.motionVectors = motion_vectors_active() ? 1 : 0;
   return find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });
 }
 
@@ -598,6 +752,10 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
     Log.warn("Dropping resolve pass without an active render pass");
     return;
   }
+  // A pass's tails draw before its copy anyway; flushed here, a frame whose see-through draws are not followed by
+  // anything else still gets its scene stage.
+  if (scene_stage::wanted())
+    flush_deferred_draws();
   ensure_staging_space({0, 2 * staging_uniform_bytes(48), 0, 0});
   auto& prevPass = g_renderPasses[g_currentRenderPass];
   const auto targetWidth = static_cast<int32_t>(prevPass.targetSize.width);
@@ -699,6 +857,9 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
   const auto msaaSamples = prevPass.msaaSamples;
   RenderPass newPass{
       .colorView = prevPass.colorView,
+      .motionView = prevPass.motionView,
+      .motionDepthView = prevPass.motionDepthView,
+      .motionMarkView = prevPass.motionMarkView,
       .resolveView = prevPass.resolveView,
       .depthView = prevPass.depthView,
       .copySourceTexture = prevPass.copySourceTexture,
@@ -749,6 +910,43 @@ void queue_palette_conv(tex_palette_conv::ConvRequest req) {
 }
 
 bool is_offscreen() noexcept { return g_inOffscreen; }
+
+static std::atomic_bool g_motionVectorsRequested{false};
+// Latched by begin_frame_impl (the recording thread); atomic only so other threads can read it for display.
+static std::atomic_bool g_motionVectorsActive{false};
+
+void request_motion_vectors(bool requested) noexcept {
+  g_motionVectorsRequested.store(requested, std::memory_order_release);
+}
+
+bool motion_vectors_wanted() noexcept { return g_motionVectorsRequested.load(std::memory_order_acquire); }
+
+bool motion_vectors_active() noexcept { return g_motionVectorsActive.load(std::memory_order_relaxed); }
+
+// At a new frame: take the request, and make the EFB motion targets match it (created at the render size, or freed).
+// Cached offscreen targets carry motion targets only if they were created with them, so they are dropped on a change.
+// Passes already recorded or being encoded keep their own references to the targets they were drawn with.
+static void latch_motion_vectors() noexcept {
+  const bool wanted = motion_vectors_wanted();
+  const auto& size = webgpu::g_frameBuffer.size;
+  const auto& motion = webgpu::g_motionVectors;
+  const bool targetsMatch =
+      wanted ? motion.texture && motion.size.width == size.width && motion.size.height == size.height : !motion.texture;
+  if (wanted == motion_vectors_active() && targetsMatch) {
+    return;
+  }
+  g_motionVectorsActive.store(wanted, std::memory_order_relaxed);
+  webgpu::create_motion_targets(wanted);
+  g_offscreenCache.clear();
+  // The change is in the pass's attachments, not in any GX state: resolve the draws' pipelines again.
+  gx::g_gxState.stateDirty = true;
+  gx::g_gxState.pipelineStateGeneration = gx::next_gx_state_epoch();
+}
+
+const MotionTargets* sealed_motion_targets(const SealedFrame& frame) noexcept {
+  const auto& motion = frame.data().motion;
+  return motion.has_value() ? &*motion : nullptr;
+}
 
 uint32_t get_sample_count() noexcept {
   if (!has_current_render_pass()) {
@@ -813,6 +1011,14 @@ static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t heigh
   OffscreenCacheEntry entry{
       .color = std::move(color),
       .depth = std::move(depth),
+      // Offscreen passes are single-sampled.
+      .motion = motion_vectors_active() ? webgpu::create_motion_target(webgpu::MotionTarget::Motion, width, height, 1)
+                                        : webgpu::TextureWithSampler{},
+      .motionDepth = motion_vectors_active()
+                         ? webgpu::create_motion_target(webgpu::MotionTarget::Depth, width, height, 1)
+                         : webgpu::TextureWithSampler{},
+      .motionMark = motion_vectors_active() ? webgpu::create_motion_target(webgpu::MotionTarget::Mark, width, height, 1)
+                                            : webgpu::TextureWithSampler{},
   };
   auto [insertIt, _] = g_offscreenCache.emplace(key, std::move(entry));
   return insertIt->second;
@@ -840,10 +1046,16 @@ void begin_offscreen(uint32_t width, uint32_t height) {
   auto offscreenEntry = get_offscreen_textures(width, height);
   g_offscreenColor = std::move(offscreenEntry.color);
   g_offscreenDepth = std::move(offscreenEntry.depth);
+  g_offscreenMotion = std::move(offscreenEntry.motion);
+  g_offscreenMotionDepth = std::move(offscreenEntry.motionDepth);
+  g_offscreenMotionMark = std::move(offscreenEntry.motionMark);
 
   // Start a new pass with offscreen targets
   RenderPass newPass{
       .colorView = g_offscreenColor.view,
+      .motionView = g_offscreenMotion.view,
+      .motionDepthView = g_offscreenMotionDepth.view,
+      .motionMarkView = g_offscreenMotionMark.view,
       .depthView = g_offscreenDepth.view,
       .copySourceTexture = g_offscreenColor.texture,
       .copySourceView = g_offscreenColor.view,
@@ -1029,6 +1241,9 @@ void initialize() {
 }
 
 void shutdown() {
+  motion::shutdown();
+  scene_stage::shutdown();
+  bloom::shutdown();
   shutdown_pipeline_cache();
   gx::clear_shader_module_cache();
   efb_ram::shutdown();
@@ -1089,7 +1304,7 @@ void map_staging_buffer() {
       });
 }
 
-static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
+static bool begin_frame_impl(bool newFrame, bool capacityResume = false) {
   ZoneScoped;
   {
     ZoneScopedN("Wait for buffer map");
@@ -1136,7 +1351,9 @@ static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
 
   g_drawCallCount = 0;
   g_mergedDrawCallCount = 0;
-  if (clearEfb) {
+  if (newFrame) {
+    latch_motion_vectors();
+    scene_stage::begin_frame();
     gx::begin_frame_interpolation();
   }
   discard_suspended_efb_pass();
@@ -1144,10 +1361,12 @@ static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
 
   push_render_pass(RenderPass{});
   set_efb_targets(g_renderPasses[0]);
-  g_renderPasses[0].clearColorValue = gx::g_gxState.clearColor;
-  g_renderPasses[0].clearDepthValue = gx::clear_depth_value();
-  g_renderPasses[0].clearColor = clearEfb;
-  g_renderPasses[0].clearDepth = clearEfb;
+  g_renderPasses[0].clearMotion = newFrame;
+  // The EFB keeps its contents from one frame to the next, as on hardware: only a copy that asks for it clears it
+  // (resolve_pass). A frame that draws nothing shows the last picture again, not the copy-clear colour (white in
+  // NO100F, whose copies never clear: the movie player's blank presents around every Bink movie flashed white).
+  g_renderPasses[0].clearColor = false;
+  g_renderPasses[0].clearDepth = false;
   g_currentRenderPass = 0;
   // Refresh paired render viewport/scissor from logical state in case the FB size changed.
   const auto mappedRenderState = gx::map_logical_render_state();
@@ -1168,7 +1387,11 @@ bool begin_frame() { return begin_frame_impl(true); }
 
 bool resume_frame() { return begin_frame_impl(false); }
 
+// Whether the frame being recorded has already been submitted in part (recording thread).
+static bool g_frameSubmittedInParts = false;
+
 void abort_frame() noexcept {
+  g_frameSubmittedInParts = false;
   efb_ram::cancel();
   efb_ram::abort_async();
   g_verts.release();
@@ -1204,12 +1427,25 @@ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
   ZoneScoped;
   ASSERT(!advanceFrame || !g_inOffscreen, "end_frame called while offscreen rendering is active");
   if (advanceFrame) {
+    if (scene_stage::wanted())
+      flush_deferred_draws(); // as in resolve_pass
     gx::finalize_frame_interpolation();
   } else {
     // Mid-frame batch split: the staging buffer is about to be unmapped and rotated, so pending
     // interpolation tasks pointing into it would dangle. Tie the clear to the rotation itself.
     gx::drop_pending_frame_interpolation_uniforms();
+    g_frameSubmittedInParts = true;
   }
+  // A frame submitted in parts has no scene stage. A part's see-through draws must go with it, as they use its staging
+  // buffers, so the last flush can come too late for them: the stage would shade them, or shade the solid scene twice.
+  if (g_frameSubmittedInParts) {
+    for (auto& pass : g_renderPasses) {
+      pass.sceneStageBefore = false;
+      pass.afterTailBefore = false;
+    }
+  }
+  if (advanceFrame)
+    g_frameSubmittedInParts = false;
   g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer
   const auto used = staging_usage();
   for (unsigned i = 0; i < used.size(); ++i) g_stagingHighWater[i] = std::max(g_stagingHighWater[i], used[i]);
@@ -1275,12 +1511,12 @@ void split_staging_batch() {
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   if (!has_current_render_pass())
     throw StagingCapacityError("Cannot split staging outside an active render pass");
-  {  // SPM diagnostic (env SPM_PASS_LOG): which staging buffer forced the split (V/U/I/S bytes used)
-    static const bool passLog = std::getenv("SPM_PASS_LOG") != nullptr;
+  {  // Diagnostic (env NO100F_PASS_LOG): which staging buffer forced the split (V/U/I/S bytes used)
+    static const bool passLog = std::getenv("NO100F_PASS_LOG") != nullptr;
     static int logged = 0;
     if (passLog && logged++ < 20) {
       const auto u = staging_usage();
-      std::fprintf(stderr, "[spmsplit] V %llu U %llu I %llu S %llu\n", (unsigned long long)u[0], (unsigned long long)u[1],
+      std::fprintf(stderr, "[gxsplit] V %llu U %llu I %llu S %llu\n", (unsigned long long)u[0], (unsigned long long)u[1],
                    (unsigned long long)u[2], (unsigned long long)u[3]);
     }
   }
@@ -1292,11 +1528,19 @@ void split_staging_batch() {
   const auto renderScissor = gx::g_gxState.renderScissor;
   const auto& active = g_renderPasses[g_currentRenderPass];
   RenderPass continuation{
-      .colorView = active.colorView, .resolveView = active.resolveView,
-      .depthView = active.depthView, .copySourceTexture = active.copySourceTexture,
-      .copySourceView = active.copySourceView, .copySourceDepthView = active.copySourceDepthView,
-      .targetSize = active.targetSize, .msaaSamples = active.msaaSamples,
-      .clearColor = false, .clearDepth = false,
+      .colorView = active.colorView,
+      .motionView = active.motionView,
+      .motionDepthView = active.motionDepthView,
+      .motionMarkView = active.motionMarkView,
+      .resolveView = active.resolveView,
+      .depthView = active.depthView,
+      .copySourceTexture = active.copySourceTexture,
+      .copySourceView = active.copySourceView,
+      .copySourceDepthView = active.copySourceDepthView,
+      .targetSize = active.targetSize,
+      .msaaSamples = active.msaaSamples,
+      .clearColor = false,
+      .clearDepth = false,
       .requireReadyPipelines = active.requireReadyPipelines || offscreen,
   };
   auto suspended = std::move(g_suspendedEfbPass);
@@ -1365,37 +1609,125 @@ static const char* render_pass_label(u32 index) noexcept {
   return index < kRenderPassLabels.size() ? kRenderPassLabels[index] : "Render pass";
 }
 
+// `onlyLight`: only the draws that sample a light texture (gx::DrawData::emitsLight), for the bloom.
 static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vector<RenderPass>& passes, u32 idx,
-                             int32_t interpolatedFrame, DebugFrameData& debugFrame);
+                             int32_t interpolatedFrame, DebugFrameData& debugFrame, bool onlyLight = false);
+
+// The bloom (bloom.hpp), at the scene stage: the frame's light draws up to the end of its see-through tail
+// (gx::DrawData::emitsLight, in the EFB passes before `afterPass`, the pass after the tail) are drawn once more, alone
+// over black, into the bloom's target, against the depth kept at the stage (the solid scene in front still hides them),
+// with stand-ins for the motion targets their pipelines also write; then the bloom adds its glow over the EFB, before
+// the tail is drawn over it.
+static void encode_bloom(const wgpu::CommandEncoder& cmd, const std::vector<RenderPass>& renderPasses, u32 afterPass,
+                         int32_t interpolatedFrame, DebugFrameData& debugFrame) {
+  if (!bloom::wanted() || !bloom::stage_depth())
+    return;
+  const auto& after = renderPasses[afterPass];
+  const auto target = bloom::tail_target(after.targetSize, after.msaaSamples);
+  const bool motionPass =
+      after.motionView != nullptr && after.motionDepthView != nullptr && after.motionMarkView != nullptr;
+  const auto scratch = motionPass ? bloom::motion_scratch(after.targetSize, after.msaaSamples) : bloom::MotionScratch{};
+  std::vector<u32> passes;
+  for (u32 i = 0; i < afterPass; ++i) {
+    if (renderPasses[i].colorView.Get() == after.colorView.Get())
+      passes.push_back(i);
+  }
+  for (size_t n = 0; n < passes.size(); ++n) {
+    const bool first = n == 0;
+    const bool last = n + 1 == passes.size();
+    const auto colorStore = target.resolve && last ? wgpu::StoreOp::Discard : wgpu::StoreOp::Store;
+    const std::array attachments{
+        wgpu::RenderPassColorAttachment{
+            .view = target.view,
+            .resolveTarget = last ? target.resolve : nullptr,
+            .loadOp = first ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = colorStore,
+            .clearValue = {.r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0},
+        },
+        wgpu::RenderPassColorAttachment{
+            .view = scratch.motion, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Discard},
+        wgpu::RenderPassColorAttachment{
+            .view = scratch.depth, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Discard},
+        wgpu::RenderPassColorAttachment{
+            .view = scratch.mark, .loadOp = wgpu::LoadOp::Clear, .storeOp = wgpu::StoreOp::Discard},
+    };
+    const wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{
+        .view = bloom::stage_depth(),
+        .depthLoadOp = wgpu::LoadOp::Load,
+        .depthStoreOp = last ? wgpu::StoreOp::Discard : wgpu::StoreOp::Store,
+    };
+    const wgpu::RenderPassDescriptor renderPassDescriptor{
+        .label = "Bloom light draws",
+        .colorAttachmentCount = motionPass ? attachments.size() : 1,
+        .colorAttachments = attachments.data(),
+        .depthStencilAttachment = &depthStencilAttachment,
+    };
+    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+    render_pass_impl(pass, renderPasses, passes[n], interpolatedFrame, debugFrame, true);
+    pass.End();
+  }
+  if (passes.empty())
+    return;
+  bloom::encode(cmd, after.colorView, after.targetSize, after.msaaSamples, after.sceneCamera.viewport);
+}
 
 static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEncoder& cmd, int32_t interpolatedFrame,
                         bool finalize, DebugFrameData& debugFrame, const depth_peek::FrameMapping& depthMapping) {
   ZoneScoped;
   // Palette conversions, MSAA resolves and EFB copies depend on sealed frame state, not on the
   // interpolation weight. Replay slots are rendered before the native frame, so the first slot encodes
-  // them too: otherwise every slot sampled the previous frame's (HUD text, icons, glow and mask flickered).
+  // them too: otherwise every slot sampled the previous frame's (HUD, icons and screen effects flickered).
   const bool encodeTextureBakes = interpolatedFrame <= 0;
-  {  // SPM diagnostic (env SPM_PASS_LOG): every 300th frame, the render passes with their clears and command counts
-    static const bool passLog = std::getenv("SPM_PASS_LOG") != nullptr;
+  {  // Diagnostic (env NO100F_PASS_LOG): every 300th frame, the render passes with their clears and command counts
+    static const bool passLog = std::getenv("NO100F_PASS_LOG") != nullptr;
     static u32 calls = 0, logged = 0;
     if (passLog && encodeTextureBakes && ++calls % 300 == 0 && logged++ < 12) {
-      std::fprintf(stderr, "[spmpass] frame call %u: %zu passes\n", calls, renderPasses.size());
+      std::fprintf(stderr, "[gxpass] frame call %u: %zu passes\n", calls, renderPasses.size());
       for (u32 i = 0; i < renderPasses.size(); ++i) {
         const auto& p = renderPasses[i];
-        std::fprintf(stderr, "[spmpass]   #%u clearColor %d clearDepth %d cmds %zu size %ux%u resolve %d copySrc %d rgba %.2f,%.2f,%.2f,%.2f\n", i,
+        std::fprintf(stderr, "[gxpass]   #%u clearColor %d clearDepth %d cmds %zu size %ux%u resolve %d copySrc %d rgba %.2f,%.2f,%.2f,%.2f\n", i,
                      p.clearColor, p.clearDepth, p.commands.size(), p.targetSize.width, p.targetSize.height, p.resolveTarget ? 1 : 0,
                      p.copySourceTexture ? 1 : 0, p.clearColorValue.x(), p.clearColorValue.y(), p.clearColorValue.z(), p.clearColorValue.w());
       }
     }
   }
+  scene_stage::release_unused_targets();
+  bloom::release_unused_targets();
+  // The scene stage runs once per frame, before the last pass that asks for it (a frame can flush its see-through
+  // tail more than once; the solid scene is finished at the last). The point after the tail is the one made with it.
+  u32 sceneStagePass = UINT32_MAX;
+  u32 afterTailPass = UINT32_MAX;
   for (u32 i = 0; i < renderPasses.size(); ++i) {
+    if (renderPasses[i].sceneStageBefore) {
+      sceneStagePass = i;
+      afterTailPass = UINT32_MAX;
+    }
+    if (renderPasses[i].afterTailBefore && sceneStagePass != UINT32_MAX && afterTailPass == UINT32_MAX)
+      afterTailPass = i;
+  }
+  for (u32 i = 0; i < renderPasses.size(); ++i) {
+    sort_particle_draws(renderPasses[i].translucent);
     const auto& passInfo = renderPasses[i];
     if (encodeTextureBakes) {
       for (const auto& conv : passInfo.paletteConvs) {
         tex_palette_conv::run(cmd, conv);
       }
     }
-    const bool hasRenderWork = passInfo.clearColor || passInfo.clearDepth || !passInfo.commands.empty();
+    if (i == sceneStagePass) {
+      scene_stage::encode(cmd, passInfo.colorView, passInfo.depthView, passInfo.targetSize, passInfo.msaaSamples,
+                          passInfo.sceneCamera);
+      if (afterTailPass != UINT32_MAX && passInfo.depthView.Get() == webgpu::g_depthBuffer.view.Get()) {
+        bloom::encode_keep_depth(cmd, webgpu::g_depthBuffer.texture, passInfo.msaaSamples);
+        encode_bloom(cmd, renderPasses, afterTailPass, interpolatedFrame, debugFrame);
+      }
+    }
+    if (i == afterTailPass) {
+      bloom::encode_view(cmd, passInfo.colorView, passInfo.targetSize, passInfo.msaaSamples,
+                         passInfo.sceneCamera.viewport);
+    }
+    const bool hasRenderWork =
+        passInfo.clearColor || passInfo.clearDepth || !passInfo.commands.empty() ||
+        !passInfo.deferred.empty() || !passInfo.translucent.empty();
     if (i == renderPasses.size() - 1) {
       ASSERT(!passInfo.resolveTarget, "Final render pass must not have resolve target");
     } else if (!(passInfo.resolveTarget && encodeTextureBakes) && !hasRenderWork) {
@@ -1404,6 +1736,11 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
       continue;
     }
 
+    // Motion vectors start each frame at zero (RenderPass::clearMotion); offscreen targets clear with their color.
+    // Recorded with the pass (motion_vectors_active then): this may run while the producer records the next frame.
+    const bool motionPass =
+        passInfo.motionView != nullptr && passInfo.motionDepthView != nullptr && passInfo.motionMarkView != nullptr;
+    const bool clearMotion = passInfo.clearColor || passInfo.clearMotion;
     const std::array attachments{
         wgpu::RenderPassColorAttachment{
             .view = passInfo.colorView,
@@ -1418,6 +1755,24 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
                     .a = passInfo.clearColorValue.w(),
                 },
         },
+        wgpu::RenderPassColorAttachment{
+            .view = passInfo.motionView,
+            .loadOp = clearMotion ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {.r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0},
+        },
+        wgpu::RenderPassColorAttachment{
+            .view = passInfo.motionDepthView,
+            .loadOp = clearMotion ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {.r = gx::UseReversedZ ? 0.0 : 1.0, .g = 0.0, .b = 0.0, .a = 0.0},
+        },
+        wgpu::RenderPassColorAttachment{
+            .view = passInfo.motionMarkView,
+            .loadOp = clearMotion ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {.r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0},
+        },
     };
     const wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{
         .view = passInfo.depthView,
@@ -1427,7 +1782,7 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
     };
     const wgpu::RenderPassDescriptor renderPassDescriptor{
         .label = render_pass_label(i),
-        .colorAttachmentCount = attachments.size(),
+        .colorAttachmentCount = motionPass ? attachments.size() : 1,
         .colorAttachments = attachments.data(),
         .depthStencilAttachment = &depthStencilAttachment,
     };
@@ -1554,6 +1909,14 @@ void seal_frame(SealedFrame& out) noexcept {
   // capacity included, back to the producer.
   recycle_render_passes(passes);
   passes.swap(g_renderPasses);
+  out.data().motion.reset();
+  if (motion_vectors_active() && webgpu::g_motionVectors.texture) {
+    out.data().motion = MotionTargets{
+        .motion = webgpu::g_motionVectors,
+        .depth = webgpu::g_motionDepth,
+        .mark = webgpu::g_motionMark,
+    };
+  }
 #ifdef AURORA_GFX_DEBUG_GROUPS
   // Marker indices and unmatched-group warnings belong to these detached passes.
   // The next producer frame must not modify strings still read by this encoder.
@@ -1589,7 +1952,7 @@ void after_submit() noexcept {
 }
 
 static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vector<RenderPass>& renderPasses, u32 idx,
-                             int32_t interpolatedFrame, DebugFrameData& debugFrame) {
+                             int32_t interpolatedFrame, DebugFrameData& debugFrame, bool onlyLight) {
   // Per-invocation, not per-process: two encoders can be recording at once.
   gx::DrawEncodeState encodeState{};
   encodeState.boundTextureBindGroup = gx::g_emptyTextureBindGroup.Get();
@@ -1601,7 +1964,9 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
   pass.SetBindGroup(0, g_staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
 
-  for (const auto& cmd : renderPasses[idx].commands) {
+  const auto& passCommands = renderPasses[idx];
+  for (const CommandList* list : {&passCommands.commands, &passCommands.deferred, &passCommands.translucent})
+  for (const auto& cmd : *list) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
     {
       size_t firstDiff = lastDebugGroupStack.size();
@@ -1663,6 +2028,8 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
       const auto& draw = cmd.data.draw;
       switch (draw.type) {
       case ShaderType::GX: {
+        if (onlyLight && !draw.gx.emitsLight)
+          break;
         const gfx::Range* uniformOverride = nullptr;
         if (interpolatedFrame >= 0 &&
             static_cast<size_t>(interpolatedFrame) < draw.gx.interpolatedUniformRanges.size() &&
@@ -1672,7 +2039,8 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
         gx::render(draw.gx, pass, encodeState, renderPasses[idx].requireReadyPipelines, uniformOverride);
       } break;
       case ShaderType::Clear:
-        clear::render(draw.clear, pass, renderPasses[idx].targetSize, encodeState.currentPipeline);
+        if (!onlyLight)
+          clear::render(draw.clear, pass, renderPasses[idx].targetSize, encodeState.currentPipeline);
         break;
       }
     } break;
@@ -1701,8 +2069,8 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass, Pipelin
   if (!skip_unready_pipelines()) {
     pipelineReady = wait_pipeline(ref, pipeline);
   } else if (requireReady) {
-    // The pass resolves into a persistent texture (a one-shot bake such as MKW's minimap), so a
-    // skipped draw would never be re-issued. These run behind loads, not mid-race.
+    // The pass resolves into a persistent texture (a one-shot bake), so a
+    // skipped draw would never be re-issued. These run behind loads, not during play.
     pipelineReady = wait_pipeline_for_persistent_pass(ref, pipeline);
   } else {
     pipelineReady = try_pipeline(ref, pipeline);

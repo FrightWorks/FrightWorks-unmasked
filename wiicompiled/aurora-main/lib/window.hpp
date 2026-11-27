@@ -2,6 +2,7 @@
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
+#include <string>
 
 struct SDL_Window;
 struct SDL_Renderer;
@@ -38,9 +39,12 @@ AuroraWindowSize get_window_size();
 const AuroraEvent* poll_events();
 SDL_Window* get_sdl_window();
 SDL_Renderer* get_sdl_renderer();
+// -1 unknown, 0 off, 1 active HDR (not merely wide-color/ACM).
+int hdr_display_state();
+std::string hdr_display_name();
 bool is_paused() noexcept;
 bool is_presentable() noexcept;
-void pump_events() noexcept;
+void pump_events();
 bool native_resize_pending() noexcept;
 bool native_window_size_matches(uint32_t width, uint32_t height) noexcept;
 void set_surface_ready(bool ready) noexcept;
@@ -49,6 +53,8 @@ void set_fullscreen(bool fullscreen);
 bool get_fullscreen();
 void set_display_mode(AuroraDisplayMode mode);
 AuroraDisplayMode get_display_mode();
+uint32_t get_monitors(AuroraMonitor* monitors, uint32_t maxCount);
+void set_fullscreen_monitor(const char* id);
 void set_window_size(uint32_t width, uint32_t height);
 void set_window_position(uint32_t x, uint32_t y);
 void center_window();

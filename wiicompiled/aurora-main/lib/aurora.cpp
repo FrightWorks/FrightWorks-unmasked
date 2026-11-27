@@ -1,9 +1,13 @@
 #include <aurora/aurora.h>
+#include <aurora/window_owner.hpp>
 
 #ifdef AURORA_ENABLE_GX
 #include "gfx/common.hpp"
 #include "gfx/texture_replacement.hpp"
 #include "gfx/efb_ram_copy.hpp"
+#include "gfx/motion_effects.hpp"
+#include "gfx/bloom.hpp"
+#include "gfx/scene_stage.hpp"
 #include "gx/fifo.hpp"
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
@@ -17,6 +21,7 @@
 #include "window.hpp"
 
 #include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_thread.h>
 #include <magic_enum.hpp>
 
@@ -30,6 +35,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -51,6 +57,8 @@ namespace aurora::gx {
 // declared here so the C entry point at the bottom of this file can forward to it.
 void report_producer_paced(bool paced) noexcept;
 } // namespace aurora::gx
+// Screenshot PNG writer, defined in lib/gfx/png_io.cpp.
+extern "C" bool aurora_write_png_rgb(const char* path, const uint8_t* rgb, uint32_t width, uint32_t height);
 #endif
 
 namespace aurora {
@@ -70,7 +78,14 @@ namespace {
 Module Log("aurora");
 
 std::atomic<uint32_t> g_captureFrame{UINT32_MAX};
+// g_captureFrame value for "the next presented frame" (screenshots).
+constexpr uint32_t kCaptureNextFrame = UINT32_MAX - 1;
+std::mutex g_captureMutex;  // guards the two below
 std::string g_captureOutputPath;
+bool g_captureScreenshot = false;  // PNG on a worker thread, result in g_screenshotResult
+std::atomic<int> g_captureOverlay{AURORA_CAPTURE_OVERLAY_NONE};  // AuroraCaptureOverlay
+// 0 = nothing new, 1 = saved, -1 = failed; read and cleared by aurora_take_screenshot_result.
+std::atomic<int> g_screenshotResult{0};
 
 using PresentClock = std::chrono::steady_clock;
 
@@ -228,8 +243,8 @@ enum class ImGuiFramePolicy {
 };
 
 bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy = ImGuiFramePolicy::Immediate,
-                      bool* imguiNewFrameOwed = nullptr) noexcept;
-bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) noexcept;
+                      bool* imguiNewFrameOwed = nullptr);
+bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed);
 void end_frame_impl(bool pumpEvents, bool drainFifo);
 
 // The two publication points of a frame-worker cycle, cleared together under `mutex`. Sealed:
@@ -295,7 +310,7 @@ bool frame_worker_requested() noexcept {
 
 #ifdef AURORA_ENABLE_GX
 // Returns false when a stop request was observed mid-cycle.
-bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept;
+bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame);
 #endif
 
 void frame_worker_main() noexcept {
@@ -323,7 +338,14 @@ void frame_worker_main() noexcept {
     // The CPU already decoded the sealed frame at its GX boundary; the worker only owns
     // encode/submit/present, so it never touches the producer's next FIFO buffer.
 #ifdef AURORA_ENABLE_GX
-    if (!run_frame_worker_cycle(sealedFrame)) {
+    try {
+      if (!run_frame_worker_cycle(sealedFrame)) break;
+    } catch (...) {
+      if (!window_owner::enabled()) std::terminate();
+      window_owner::report_failure(std::current_exception());
+      std::lock_guard lock(g_frameWorker.mutex);
+      g_frameWorker.stop = true;
+      g_frameWorker.framePrepared = false;
       break;
     }
 #endif
@@ -362,15 +384,15 @@ bool frame_worker_phase_reached(FrameWorkerPhase phase) noexcept {
                                            : g_frameWorker.ready.load(std::memory_order_acquire);
 }
 
-bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout) noexcept;
+bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout);
 
-void wait_for_frame_worker_private(FrameWorkerPhase phase) noexcept {
+void wait_for_frame_worker_private(FrameWorkerPhase phase) {
   constexpr auto kWaitServiceInterval = std::chrono::milliseconds(1);
   while (!wait_for_frame_worker_private_for(phase, kWaitServiceInterval)) {
   }
 }
 
-bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout) noexcept {
+bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout) {
   // Each phase's state is published before its flag is set, which keeps the common
   // display-list path out of the worker control mutex.
   if (frame_worker_phase_reached(phase)) {
@@ -504,34 +526,238 @@ struct PendingFrameCapture {
   uint32_t bytesPerRow = 0;
   uint64_t bufferSize = 0;
   bool bgra = false;
+  bool screenshot = false;
   std::string path;
 };
 
+// FrightWorks captures with the overlay choice (aurora_set_capture_overlay) and video frames (aurora_set_video_capture):
+// the window's picture is drawn again into a capture texture (the game scaled as on screen, then a subset of this
+// frame's ImGui lists) and copied into a buffer that is read back.
+struct CaptureTarget {
+  webgpu::TextureWithSampler texture;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
+bool capture_format_supported(wgpu::TextureFormat format) noexcept {
+  return format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::BGRA8UnormSrgb ||
+         format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::RGBA8UnormSrgb;
+}
+
+bool capture_format_bgra(wgpu::TextureFormat format) noexcept {
+  return format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::BGRA8UnormSrgb;
+}
+
+// scale = width / the window's framebuffer width (ImGui's coordinates are the window's).
+void encode_capture_image(const wgpu::CommandEncoder& encoder, const webgpu::PresentSource& source,
+                          CaptureTarget& target, uint32_t width, uint32_t height, float scale, bool stampOnly) {
+  if (!target.texture.texture || target.width != width || target.height != height) {
+    target.texture = webgpu::create_render_texture(width, height, false);
+    target.width = width;
+    target.height = height;
+  }
+  const uint32_t targetWidth = target.texture.size.width;
+  const uint32_t targetHeight = target.texture.size.height;
+  auto viewport =
+      webgpu::calculate_present_viewport(targetWidth, targetHeight, source.size.width, source.size.height);
+  float presentAspect = 0.f;
+  if (window::get_present_aspect_ratio(presentAspect)) {
+    viewport = webgpu::calculate_present_viewport_for_aspect(targetWidth, targetHeight, presentAspect);
+  }
+  const wgpu::RenderPassColorAttachment attachment{
+      .view = target.texture.view,
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+  };
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Capture image pass",
+      .colorAttachmentCount = 1,
+      .colorAttachments = &attachment,
+  };
+  const auto pass = encoder.BeginRenderPass(&descriptor);
+  pass.SetPipeline(webgpu::g_CopyPipeline);
+  pass.SetBindGroup(0, source.bindGroup, 0, nullptr);
+  pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height, viewport.znear, viewport.zfar);
+  pass.Draw(3);
+  pass.SetViewport(0.f, 0.f, static_cast<float>(targetWidth), static_cast<float>(targetHeight), 0.f, 1.f);
+  imgui::render_capture(pass, stampOnly, scale);
+  pass.End();
+}
+
+CaptureTarget g_screenshotTarget;
+CaptureTarget g_videoTarget;
+
+int64_t unix_micros_now() noexcept {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// Video readback slots: Free -> Copied (copy recorded) -> Mapping (after submit) -> callback -> Free.
+struct VideoSlot {
+  enum class State { Free, Copied, Mapping };
+  wgpu::Buffer buffer;
+  uint64_t bufferSize = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t bytesPerRow = 0;
+  bool bgra = false;
+  int64_t unixMicros = 0;
+  State state = State::Free;
+};
+std::mutex g_videoMutex;  // guards everything below; held while the callback runs
+AuroraVideoFrameCallback g_videoCallback = nullptr;
+void* g_videoUser = nullptr;
+uint32_t g_videoMaxHeight = 1080;
+std::array<VideoSlot, 4> g_videoSlots;
+std::vector<uint8_t> g_videoPacked;
+
+void encode_video_frame(const wgpu::CommandEncoder& encoder, const webgpu::PresentSource& source,
+                        uint32_t windowWidth, uint32_t windowHeight) {
+  if (!source.texture || windowWidth == 0 || windowHeight == 0) return;
+  VideoSlot* slot = nullptr;
+  uint32_t maxHeight = 0;
+  {
+    std::lock_guard lock(g_videoMutex);
+    if (g_videoCallback == nullptr) return;
+    for (auto& candidate : g_videoSlots) {
+      if (candidate.state == VideoSlot::State::Free) {
+        slot = &candidate;
+        break;
+      }
+    }
+    maxHeight = g_videoMaxHeight;
+  }
+  if (slot == nullptr) return;  // the readback is behind: skip this frame
+  const auto format = webgpu::g_graphicsConfig.surfaceConfiguration.format;
+  if (!capture_format_supported(format)) return;
+  const float scale = windowHeight > maxHeight ? static_cast<float>(maxHeight) / static_cast<float>(windowHeight) : 1.f;
+  const uint32_t width = (std::max)(2u, static_cast<uint32_t>(static_cast<float>(windowWidth) * scale) & ~1u);
+  const uint32_t height = (std::max)(2u, static_cast<uint32_t>(static_cast<float>(windowHeight) * scale) & ~1u);
+  const bool stampOnly = g_captureOverlay.load(std::memory_order_acquire) != AURORA_CAPTURE_OVERLAY_ALL;
+  encode_capture_image(encoder, source, g_videoTarget, width, height, scale, stampOnly);
+  const auto& texture = g_videoTarget.texture;
+  const uint32_t bytesPerRow = align_to(texture.size.width * 4, 256);
+  const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * texture.size.height;
+  if (!slot->buffer || slot->bufferSize != bufferSize) {
+    const wgpu::BufferDescriptor descriptor{
+        .label = "Video frame readback",
+        .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+        .size = bufferSize,
+    };
+    slot->buffer = g_device.CreateBuffer(&descriptor);
+    slot->bufferSize = bufferSize;
+  }
+  const wgpu::TexelCopyTextureInfo sourceInfo{
+      .texture = texture.texture,
+      .mipLevel = 0,
+      .origin = {0, 0, 0},
+      .aspect = wgpu::TextureAspect::All,
+  };
+  const wgpu::TexelCopyBufferInfo destinationInfo{
+      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = texture.size.height},
+      .buffer = slot->buffer,
+  };
+  encoder.CopyTextureToBuffer(&sourceInfo, &destinationInfo, &texture.size);
+  std::lock_guard lock(g_videoMutex);
+  slot->width = texture.size.width;
+  slot->height = texture.size.height;
+  slot->bytesPerRow = bytesPerRow;
+  slot->bgra = capture_format_bgra(format);
+  slot->unixMicros = unix_micros_now();
+  slot->state = VideoSlot::State::Copied;
+}
+
+void complete_video_slot(size_t index, wgpu::MapAsyncStatus status) {
+  std::lock_guard lock(g_videoMutex);
+  auto& slot = g_videoSlots[index];
+  if (status == wgpu::MapAsyncStatus::Success) {
+    const auto* mapped = static_cast<const uint8_t*>(slot.buffer.GetConstMappedRange(0, slot.bufferSize));
+    if (mapped != nullptr && g_videoCallback != nullptr) {
+      const uint32_t rowBytes = slot.width * 4;
+      const uint8_t* pixels = mapped;
+      if (slot.bytesPerRow != rowBytes) {
+        g_videoPacked.resize(static_cast<size_t>(rowBytes) * slot.height);
+        for (uint32_t y = 0; y < slot.height; ++y) {
+          std::memcpy(g_videoPacked.data() + static_cast<size_t>(y) * rowBytes,
+                      mapped + static_cast<size_t>(y) * slot.bytesPerRow, rowBytes);
+        }
+        pixels = g_videoPacked.data();
+      }
+      g_videoCallback(pixels, slot.width, slot.height, slot.bgra, slot.unixMicros, g_videoUser);
+    }
+    slot.buffer.Unmap();
+  } else if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
+    Log.warn("Video frame readback failed: {}", magic_enum::enum_name(status));
+  }
+  slot.state = VideoSlot::State::Free;
+}
+
+// After the submit that holds the copies: start reading them back. Completion runs on whatever thread Dawn reports
+// it from (AllowSpontaneous), at the latest in the next ProcessEvents.
+void start_video_readbacks() {
+  std::vector<size_t> indices;
+  {
+    std::lock_guard lock(g_videoMutex);
+    for (size_t i = 0; i < g_videoSlots.size(); ++i) {
+      if (g_videoSlots[i].state == VideoSlot::State::Copied) {
+        g_videoSlots[i].state = VideoSlot::State::Mapping;
+        indices.push_back(i);
+      }
+    }
+  }
+  for (const size_t i : indices) {
+    g_videoSlots[i].buffer.MapAsync(wgpu::MapMode::Read, 0, g_videoSlots[i].bufferSize,
+                                    wgpu::CallbackMode::AllowSpontaneous,
+                                    [i](wgpu::MapAsyncStatus status, wgpu::StringView) { complete_video_slot(i, status); });
+  }
+}
+
 std::optional<PendingFrameCapture> encode_frame_capture(const wgpu::CommandEncoder& encoder,
-                                                        const webgpu::PresentSource& source) {
-  const uint32_t requestedFrame = g_captureFrame.load(std::memory_order_acquire);
+                                                        const webgpu::PresentSource& source, uint32_t windowWidth,
+                                                        uint32_t windowHeight) {
+  uint32_t requestedFrame = g_captureFrame.load(std::memory_order_acquire);
   const uint32_t currentFrame = gfx::current_frame();
+  if (requestedFrame == kCaptureNextFrame) requestedFrame = currentFrame;
   if (requestedFrame == UINT32_MAX || currentFrame < requestedFrame) return std::nullopt;
   g_captureFrame.store(UINT32_MAX, std::memory_order_release);
+  std::string path;
+  bool screenshot = false;
+  {
+    std::lock_guard lock(g_captureMutex);
+    path = g_captureOutputPath;
+    screenshot = g_captureScreenshot;
+  }
   if (currentFrame != requestedFrame) {
     Log.error("Missed requested frame capture {} (current frame {})", requestedFrame, currentFrame);
     return std::nullopt;
   }
   if (!source.texture || source.size.width == 0 || source.size.height == 0) {
     Log.error("Frame {} capture has no present-source texture", currentFrame);
+    if (screenshot) g_screenshotResult.store(-1, std::memory_order_release);
     return std::nullopt;
   }
-  const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm ||
-                    source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
-  const bool rgba = source.format == wgpu::TextureFormat::RGBA8Unorm ||
-                    source.format == wgpu::TextureFormat::RGBA8UnormSrgb;
-  if (!bgra && !rgba) {
-    Log.error("Frame {} capture does not support texture format {}", currentFrame,
-              magic_enum::enum_name(source.format));
+  // A screenshot with an overlay choice is the window's picture; otherwise the game frame at its render size.
+  wgpu::Texture texture = source.texture;
+  wgpu::Extent3D size = source.size;
+  wgpu::TextureFormat format = source.format;
+  const auto overlay = static_cast<AuroraCaptureOverlay>(g_captureOverlay.load(std::memory_order_acquire));
+  if (screenshot && overlay != AURORA_CAPTURE_OVERLAY_NONE && windowWidth != 0 && windowHeight != 0 &&
+      capture_format_supported(webgpu::g_graphicsConfig.surfaceConfiguration.format)) {
+    encode_capture_image(encoder, source, g_screenshotTarget, windowWidth, windowHeight, 1.f,
+                         overlay == AURORA_CAPTURE_OVERLAY_STAMP);
+    texture = g_screenshotTarget.texture.texture;
+    size = g_screenshotTarget.texture.size;
+    format = g_screenshotTarget.texture.format;
+  }
+  const bool bgra = capture_format_bgra(format);
+  if (!capture_format_supported(format)) {
+    Log.error("Frame {} capture does not support texture format {}", currentFrame, magic_enum::enum_name(format));
+    if (screenshot) g_screenshotResult.store(-1, std::memory_order_release);
     return std::nullopt;
   }
-  const uint32_t bytesPerRow = align_to(source.size.width * 4, 256);
-  const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * source.size.height;
+  const uint32_t bytesPerRow = align_to(size.width * 4, 256);
+  const uint64_t bufferSize = static_cast<uint64_t>(bytesPerRow) * size.height;
   const wgpu::BufferDescriptor descriptor{
       .label = "Visual validation frame capture",
       .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
@@ -539,24 +765,25 @@ std::optional<PendingFrameCapture> encode_frame_capture(const wgpu::CommandEncod
   };
   auto buffer = g_device.CreateBuffer(&descriptor);
   const wgpu::TexelCopyTextureInfo sourceInfo{
-      .texture = source.texture,
+      .texture = texture,
       .mipLevel = 0,
       .origin = {0, 0, 0},
       .aspect = wgpu::TextureAspect::All,
   };
   const wgpu::TexelCopyBufferInfo destinationInfo{
-      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = source.size.height},
+      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = size.height},
       .buffer = buffer,
   };
-  encoder.CopyTextureToBuffer(&sourceInfo, &destinationInfo, &source.size);
+  encoder.CopyTextureToBuffer(&sourceInfo, &destinationInfo, &size);
   return PendingFrameCapture{
       .buffer = std::move(buffer),
-      .width = source.size.width,
-      .height = source.size.height,
+      .width = size.width,
+      .height = size.height,
       .bytesPerRow = bytesPerRow,
       .bufferSize = bufferSize,
       .bgra = bgra,
-      .path = g_captureOutputPath,
+      .screenshot = screenshot,
+      .path = std::move(path),
   };
 }
 
@@ -573,9 +800,35 @@ void complete_frame_capture(PendingFrameCapture& capture) {
   if (waitStatus != wgpu::WaitStatus::Success || mapStatus != wgpu::MapAsyncStatus::Success) {
     Log.error("Frame capture readback failed wait={} map={} message={}", magic_enum::enum_name(waitStatus),
               magic_enum::enum_name(mapStatus), mapMessage);
+    if (capture.screenshot) g_screenshotResult.store(-1, std::memory_order_release);
     return;
   }
   const auto* pixels = static_cast<const uint8_t*>(capture.buffer.GetConstMappedRange(0, capture.bufferSize));
+  if (capture.screenshot) {
+    // Copy out as opaque RGB and encode the PNG off the presentation thread.
+    std::vector<uint8_t> rgb(static_cast<size_t>(capture.width) * capture.height * 3);
+    const int r = capture.bgra ? 2 : 0, b = capture.bgra ? 0 : 2;
+    for (uint32_t y = 0; y < capture.height; ++y) {
+      const uint8_t* src = pixels + static_cast<size_t>(y) * capture.bytesPerRow;
+      uint8_t* dst = rgb.data() + static_cast<size_t>(y) * capture.width * 3;
+      for (uint32_t x = 0; x < capture.width; ++x, src += 4, dst += 3) {
+        dst[0] = src[r];
+        dst[1] = src[1];
+        dst[2] = src[b];
+      }
+    }
+    capture.buffer.Unmap();
+    std::thread([rgb = std::move(rgb), path = capture.path, width = capture.width, height = capture.height] {
+      const bool ok = aurora_write_png_rgb(path.c_str(), rgb.data(), width, height);
+      if (ok) {
+        Log.info("Screenshot saved to '{}' ({}x{})", path, width, height);
+      } else {
+        Log.error("Failed to write screenshot '{}'", path);
+      }
+      g_screenshotResult.store(ok ? 1 : -1, std::memory_order_release);
+    }).detach();
+    return;
+  }
   if (write_bmp(capture.path.c_str(), pixels, capture.width, capture.height, capture.bytesPerRow, capture.bgra)) {
     Log.info("Captured rendered frame to '{}' ({}x{})", capture.path, capture.width, capture.height);
   } else {
@@ -583,6 +836,7 @@ void complete_frame_capture(PendingFrameCapture& capture) {
   }
   capture.buffer.Unmap();
 }
+
 #endif
 
 // AuroraBackend is an anonymous C typedef enum, which magic_enum cannot
@@ -648,7 +902,7 @@ constexpr std::array<AuroraBackend, 0> PreferredBackendOrder{};
 bool g_initialFrame = false;
 
 
-AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexcept {
+AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) {
   g_config = config;
   Log.info("Aurora initializing");
   log_system_information();
@@ -657,6 +911,10 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   } else {
     g_config.appName = strdup(g_config.appName);
   }
+  // SDL's name for the app on Linux: the sound stream in volume mixers (PipeWire, PulseAudio, JACK) and the screensaver
+  // inhibit; without it they say "SDL Application". Read when the audio device opens, so it is set before. SDL_APP_NAME in
+  // the environment still wins.
+  SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, g_config.appName);
   if (g_config.userPath == nullptr) {
     g_config.userPath = SDL_GetPrefPath(nullptr, g_config.appName);
   } else {
@@ -672,6 +930,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   } else {
     g_config.resourcesPath = strdup(g_config.resourcesPath);
   }
+  if (g_config.extraTexturePath != nullptr) {
+    g_config.extraTexturePath = strdup(g_config.extraTexturePath);
+  }
   if (g_config.pipelineCachePath == nullptr) {
     g_config.pipelineCachePath = g_config.cachePath;
   } else {
@@ -680,6 +941,13 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (g_config.msaa == 0) {
     g_config.msaa = 1;
   }
+#ifdef AURORA_ENABLE_GX
+  // Before the graphics start, so the pipeline prewarm builds the kind the first frames use.
+  gfx::motion::set_blur(g_config.motionBlur);
+  gfx::scene_stage::set_ambient_occlusion(g_config.ambientOcclusion);
+  gfx::scene_stage::set_ink_outlines(g_config.inkOutlines);
+  gfx::bloom::set_strength(g_config.bloom);
+#endif
   if (g_config.maxTextureAnisotropy == 0) {
     g_config.maxTextureAnisotropy = 16;
   }
@@ -901,7 +1169,7 @@ std::shared_ptr<PresentationImage> acquire_presentation_image(size_t slot, uint3
   return image;
 }
 
-// NSMBW V-Sync: how long the last presentation waited to acquire a swapchain image. A long wait
+// V-Sync: how long the last presentation waited to acquire a swapchain image. A long wait
 // means the flip queue is backed up (frames queued while V-Sync was switched on); with the game's
 // clock locked to the display that backlog never drains by itself, so the presenter drops a frame.
 std::atomic<int64_t> g_lastAcquireNanos{0};
@@ -978,6 +1246,9 @@ bool present_presentation_job(const PresentationJob& job) {
         const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
         pass.SetPipeline(webgpu::g_PresentPipeline);
         pass.SetBindGroup(0, job.image->bindGroup, 0, nullptr);
+        if (webgpu::g_HdrCalibrationBindGroup) {
+          pass.SetBindGroup(1, webgpu::g_HdrCalibrationBindGroup, 0, nullptr);
+        }
         pass.SetViewport(0.f, 0.f,
                          static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.width),
                          static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.height),
@@ -997,6 +1268,7 @@ bool present_presentation_job(const PresentationJob& job) {
         const auto submitStarted = PresentClock::now();
         {
           std::lock_guard submitLock(g_queueSubmitMutex);
+          webgpu::upload_hdr_calibration();
           g_queue.Submit(1, &buffer);
         }
         submitDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1404,14 +1676,14 @@ wgpu::BindGroup encode_presentation_snapshot(wgpu::CommandEncoder& encoder,
     const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
     pass.SetViewport(0.f, 0.f, static_cast<float>(image.texture.size.width),
                      static_cast<float>(image.texture.size.height), 0.f, 1.f);
-    imgui::render(pass);
+    imgui::render(pass, image.texture.size.width, image.texture.size.height);
     pass.End();
   }
   return newMetalFXOutput;
 }
 #endif
 
-void shutdown() noexcept {
+void shutdown() {
   stop_frame_worker();
 #ifdef AURORA_ENABLE_GX
   stop_presenter();
@@ -1431,7 +1703,7 @@ void shutdown() noexcept {
   window::shutdown();
 }
 
-const AuroraEvent* update() noexcept {
+const AuroraEvent* update() {
   ZoneScoped;
   if (g_initialFrame) {
     g_initialFrame = false;
@@ -1440,7 +1712,7 @@ const AuroraEvent* update() noexcept {
   return window::poll_events();
 }
 
-bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) noexcept {
+bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   webgpu::fail_if_device_lost();
@@ -1506,7 +1778,7 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
 #endif
 }
 
-bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) noexcept {
+bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewFrameOwed) {
 #ifdef AURORA_ENABLE_GX
   std::lock_guard gpuLock(g_rendererGpuMutex);
   // Note the debt before gfx::begin_frame() can fail: the synchronous path always started the
@@ -1584,6 +1856,20 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   gfx::expire_bind_group_cache();
 }
 
+// Motion blur and the motion-vector view for presentation image `slot` of `count` + 1 (0-based; the frame's own image
+// is the last, slot = count). An interpolated image's motion reaches back to the last frame from its point in between,
+// (slot + 1) / (count + 1) of the way, so it is scaled up by the inverse: every image is blurred by a whole frame's
+// motion, as without frame interpolation (the setting means the same at any frame rate).
+webgpu::PresentSource encode_motion_effects(const wgpu::CommandEncoder& encoder, const gfx::SealedFrame& sealedFrame,
+                                            const webgpu::PresentSource& source, uint32_t slot, uint32_t count) {
+  const auto* motion = gfx::sealed_motion_targets(sealedFrame);
+  if (motion == nullptr) {
+    return source;
+  }
+  return gfx::motion::encode(encoder, source, *motion,
+                             static_cast<float>(count + 1) / static_cast<float>(std::min(slot, count) + 1));
+}
+
 // Phase 2: encode every presentation slot. Reads only `ctx` and the sealed passes, so it runs
 // without the renderer GPU mutex while the producer records the next frame.
 std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
@@ -1632,7 +1918,10 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
       gfx::render(sealedFrame, encoder, static_cast<int32_t>(interpolatedFrame), false);
       auto image =
           acquire_presentation_image(interpolatedFrame, ctx.snapshotWidth, ctx.snapshotHeight);
-      encode_presentation_snapshot(encoder, ctx.presentSource, *image, true, ctx.metalfxEnabled);
+      encode_presentation_snapshot(
+          encoder,
+          encode_motion_effects(encoder, sealedFrame, ctx.presentSource, interpolatedFrame, ctx.interpolatedFrameCount),
+          *image, true, ctx.metalfxEnabled);
       presentationJobs.push_back({
           .image = std::move(image),
           .logicalFrame = ctx.logicalFrame,
@@ -1647,6 +1936,9 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
   // A demanded CPU-visible EFB readback submits a prefix of the frame, so replaying the resumed
   // stream would mutate an already-rendered EFB. Render once, then duplicate into the slots.
   gfx::render(sealedFrame, encoder, -1, true);
+  // Also the images duplicated from this one (no replay).
+  ctx.presentSource = encode_motion_effects(encoder, sealedFrame, ctx.presentSource, ctx.interpolatedFrameCount,
+                                            ctx.interpolatedFrameCount);
   // The copy targets now hold this frame's resolves, so queue their readbacks on the same encoder;
   // completion is harvested in gfx::after_submit, never waited on here.
   gfx::efb_ram::encode_async_downloads(encoder);
@@ -1677,7 +1969,9 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
       acquire_presentation_image(ctx.interpolatedFrameCount, ctx.snapshotWidth, ctx.snapshotHeight);
   encode_presentation_snapshot(encoder, ctx.presentSource, *finalImage, true, ctx.metalfxEnabled,
                                duplicatedMetalFXOutput ? &duplicatedMetalFXOutput : nullptr);
-  auto pendingFrameCapture = encode_frame_capture(encoder, ctx.presentSource);
+  auto pendingFrameCapture =
+      encode_frame_capture(encoder, ctx.presentSource, ctx.snapshotWidth, ctx.snapshotHeight);
+  encode_video_frame(encoder, ctx.presentSource, ctx.snapshotWidth, ctx.snapshotHeight);
   presentationJobs.push_back({
       .image = std::move(finalImage),
       .logicalFrame = ctx.logicalFrame,
@@ -1721,6 +2015,7 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     s_lastGroupAnchor = {};
   }
 
+  start_video_readbacks();
   if (pendingFrameCapture.has_value()) {
     complete_frame_capture(*pendingFrameCapture);
   }
@@ -1801,7 +2096,7 @@ void record_frame_telemetry() {
 
 // One complete frame-worker cycle. The scene encode only leaves the renderer mutex when
 // interpolation actually inserts slots; otherwise both phases publish together.
-bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
+bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) {
   ZoneScopedN("Frame worker cycle");
   webgpu::fail_if_device_lost();
   SealedFrameContext ctx;
@@ -1918,7 +2213,8 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
 #endif
 }
 
-bool begin_frame() noexcept {
+bool begin_frame() {
+  if (window_owner::enabled()) window_owner::check();
 #ifdef AURORA_ENABLE_GX
   // The asynchronous fast path below can return a logically prepared frame
   // without entering begin_frame_impl(), so loss must be checked before it.
@@ -2012,17 +2308,24 @@ void end_frame() {
 }
 } // namespace
 
-void wait_for_frame_worker() noexcept { wait_for_frame_worker_private(FrameWorkerPhase::Done); }
-std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept {
+void wait_for_frame_worker() {
+  wait_for_frame_worker_private(FrameWorkerPhase::Done);
+  if (window_owner::enabled()) window_owner::check();
+}
+std::chrono::nanoseconds wait_for_frame_worker_sealed() {
+  if (window_owner::enabled()) window_owner::check();
   if (g_frameWorker.sealed.load(std::memory_order_acquire)) {
     return std::chrono::nanoseconds::zero();
   }
   const auto started = std::chrono::steady_clock::now();
   wait_for_frame_worker_private(FrameWorkerPhase::Sealed);
+  if (window_owner::enabled()) window_owner::check();
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
 }
-bool wait_for_frame_worker_for(std::chrono::microseconds timeout) noexcept {
-  return wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);
+bool wait_for_frame_worker_for(std::chrono::microseconds timeout) {
+  const bool result = wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);
+  if (window_owner::enabled()) window_owner::check();
+  return result;
 }
 std::recursive_mutex& renderer_gpu_mutex() noexcept { return g_rendererGpuMutex; }
 void submit_staging_commands(const wgpu::CommandBuffer& commands) {
@@ -2072,6 +2375,27 @@ void aurora_set_vsync(bool enabled) { aurora::webgpu::request_vsync(enabled); }
 void aurora_set_hdr(bool enabled, float paperWhiteNits, float peakNits) {
   aurora::webgpu::request_hdr(enabled, paperWhiteNits, peakNits);
 }
+bool aurora_set_hdr_brightness(float paperWhiteNits, float peakNits) {
+  return aurora::webgpu::set_hdr_brightness(paperWhiteNits, peakNits);
+}
+AuroraHdrCalibrationStatus aurora_get_hdr_calibration_status() {
+  if (!aurora::webgpu::hdr_active())
+    return aurora::webgpu::hdr_sdr_display() ? AURORA_HDR_CALIBRATION_STAYED_SDR : AURORA_HDR_CALIBRATION_OUTPUT_OFF;
+  const auto backend = aurora::webgpu::g_backendType;
+  if (backend != wgpu::BackendType::D3D11 && backend != wgpu::BackendType::D3D12)
+    return AURORA_HDR_CALIBRATION_UNSUPPORTED_BACKEND;
+  const int state = aurora::window::hdr_display_state();
+  return state < 0 ? AURORA_HDR_CALIBRATION_DISPLAY_UNKNOWN :
+         state == 0 ? AURORA_HDR_CALIBRATION_DISPLAY_OFF : AURORA_HDR_CALIBRATION_READY;
+}
+const char* aurora_get_hdr_display_name() {
+  thread_local std::string name;
+  name = aurora::window::hdr_display_name();
+  return name.c_str();
+}
+void aurora_set_hdr_calibration(const AuroraHdrCalibration* calibration) {
+  aurora::webgpu::set_hdr_calibration(calibration);
+}
 bool aurora_get_vsync() { return aurora::webgpu::vsync_enabled(); }
 void aurora_set_frame_interpolation_fps(uint32_t targetFps) {
 #ifdef AURORA_ENABLE_GX
@@ -2088,8 +2412,45 @@ uint32_t aurora_get_frame_interpolation_fps() {
 #endif
 }
 void aurora_request_frame_capture(uint32_t frame, const char* outputPath) {
-  aurora::g_captureOutputPath = outputPath != nullptr ? outputPath : "frame_capture.bmp";
+  {
+    std::lock_guard lock(aurora::g_captureMutex);
+    aurora::g_captureOutputPath = outputPath != nullptr ? outputPath : "frame_capture.bmp";
+    aurora::g_captureScreenshot = false;
+  }
   aurora::g_captureFrame.store(frame, std::memory_order_release);
+}
+void aurora_request_screenshot(const char* outputPath) {
+  if (outputPath == nullptr) return;
+  {
+    std::lock_guard lock(aurora::g_captureMutex);
+    aurora::g_captureOutputPath = outputPath;
+    aurora::g_captureScreenshot = true;
+  }
+  aurora::g_captureFrame.store(aurora::kCaptureNextFrame, std::memory_order_release);
+}
+int aurora_take_screenshot_result() {
+  return aurora::g_screenshotResult.exchange(0, std::memory_order_acq_rel);
+}
+void aurora_set_capture_overlay(AuroraCaptureOverlay overlay) {
+  aurora::g_captureOverlay.store(overlay, std::memory_order_release);
+}
+bool aurora_set_video_capture(AuroraVideoFrameCallback callback, void* user, uint32_t maxHeight) {
+#ifdef AURORA_ENABLE_GX
+  if (callback != nullptr &&
+      !aurora::capture_format_supported(aurora::webgpu::g_graphicsConfig.surfaceConfiguration.format)) {
+    return false;
+  }
+  std::lock_guard lock(aurora::g_videoMutex);
+  aurora::g_videoCallback = callback;
+  aurora::g_videoUser = user;
+  aurora::g_videoMaxHeight = maxHeight != 0 ? maxHeight : 1080;
+  return true;
+#else
+  (void)callback;
+  (void)user;
+  (void)maxHeight;
+  return false;
+#endif
 }
 bool aurora_flush_efb_copies_to_ram() {
 #ifdef AURORA_ENABLE_GX
@@ -2182,10 +2543,207 @@ void aurora_set_background_input(bool value) {
 }
 void aurora_set_display_mode(AuroraDisplayMode mode) { aurora::window::set_display_mode(mode); }
 AuroraDisplayMode aurora_get_display_mode() { return aurora::window::get_display_mode(); }
-void aurora_set_metalfx_spatial(bool enabled) { aurora::g_metalfxRequested.store(enabled); }
-void aurora_set_button_icon_style(int style) {
+uint32_t aurora_get_monitors(AuroraMonitor* monitors, uint32_t maxCount) {
+  return aurora::window::get_monitors(monitors, maxCount);
+}
+void aurora_set_fullscreen_monitor(const char* id) { aurora::window::set_fullscreen_monitor(id); }
+void aurora_set_motion_blur(float shutter) {
 #ifdef AURORA_ENABLE_GX
-  aurora::gfx::texture_replacement::set_button_icon_style(style);
+  aurora::gfx::motion::set_blur(shutter);
+#endif
+}
+float aurora_get_motion_blur() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::motion::blur();
+#else
+  return 0.f;
+#endif
+}
+bool aurora_motion_vectors_active() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::motion_vectors_active();
+#else
+  return false;
+#endif
+}
+void aurora_set_scene_stage_view(int mode) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::scene_stage::set_view(mode);
+#endif
+}
+int aurora_get_scene_stage_view() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::scene_stage::view();
+#else
+  return 0;
+#endif
+}
+void aurora_set_ambient_occlusion(float strength) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::scene_stage::set_ambient_occlusion(strength);
+#endif
+}
+float aurora_get_ambient_occlusion() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::scene_stage::ambient_occlusion();
+#else
+  return 0.f;
+#endif
+}
+void aurora_set_ink_outlines(int level) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::scene_stage::set_ink_outlines(level);
+#endif
+}
+int aurora_get_ink_outlines() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::scene_stage::ink_outlines();
+#else
+  return 0;
+#endif
+}
+void aurora_set_bloom(float strength) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::bloom::set_strength(strength);
+#endif
+}
+float aurora_get_bloom() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::bloom::strength();
+#else
+  return 0.f;
+#endif
+}
+void aurora_set_light_textures(const char* const* keys, uint32_t count) {
+#ifdef AURORA_ENABLE_GX
+  std::vector<std::string> list;
+  list.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (keys[i] != nullptr)
+      list.emplace_back(keys[i]);
+  }
+  aurora::gfx::bloom::set_light_textures(list);
+#endif
+}
+void aurora_set_bloom_view(int mode) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::bloom::set_view(mode);
+#endif
+}
+int aurora_get_bloom_view() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::bloom::view();
+#else
+  return 0;
+#endif
+}
+void aurora_set_motion_vector_view(int mode, float scale) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::motion::set_view(mode, scale);
+#endif
+}
+int aurora_get_motion_vector_view() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::motion::view();
+#else
+  return 0;
+#endif
+}
+float aurora_get_motion_vector_view_scale() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::motion::view_scale();
+#else
+  return 16.f;
+#endif
+}
+void aurora_set_cutout_mode(int mode) {
+#ifdef AURORA_ENABLE_GX
+  if (mode >= 0 && mode <= static_cast<int>(aurora::gx::CutoutMode::TwoPassAll))
+    aurora::gx::set_cutout_mode(static_cast<aurora::gx::CutoutMode>(mode));
+#endif
+}
+int aurora_get_cutout_mode() {
+#ifdef AURORA_ENABLE_GX
+  return static_cast<int>(aurora::gx::cutout_mode());
+#else
+  return 0;
+#endif
+}
+void aurora_set_metalfx_spatial(bool enabled) { aurora::g_metalfxRequested.store(enabled); }
+void aurora_set_button_icons(int family, const char* const buttons[4]) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::ButtonIcons icons{.family = family};
+  for (size_t i = 0; buttons != nullptr && i < icons.buttons.size(); ++i) {
+    if (buttons[i] != nullptr) icons.buttons[i] = buttons[i];
+  }
+  aurora::gfx::texture_replacement::set_button_icons(icons);
+#endif
+}
+size_t aurora_get_button_icon_folder(char* out, size_t size) {
+  std::string folder;
+#ifdef AURORA_ENABLE_GX
+  folder = aurora::gfx::texture_replacement::button_icon_folder();
+#endif
+  if (out != nullptr && size > 0) {
+    const size_t n = std::min(folder.size(), size - 1);
+    std::memcpy(out, folder.data(), n);
+    out[n] = '\0';
+  }
+  return folder.size();
+}
+void aurora_texture_track_drawn(bool on) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::track_drawn(on);
+#endif
+}
+size_t aurora_texture_drawn(AuroraDrawnTexture* out, size_t capacity) {
+#ifdef AURORA_ENABLE_GX
+  const auto list = aurora::gfx::texture_replacement::drawn_textures();
+  for (size_t i = 0; i < list.size() && i < capacity; ++i) {
+    const auto& t = list[i];
+    AuroraDrawnTexture& o = out[i];
+    const size_t n = std::min(t.name.size(), sizeof(o.name) - 1);
+    std::memcpy(o.name, t.name.data(), n);
+    o.name[n] = '\0';
+    o.width = t.width;
+    o.height = t.height;
+    o.format = t.format;
+    o.versions = t.versions;
+    o.file_width = t.fileWidth;
+    o.file_height = t.fileHeight;
+    o.pack = t.pack;
+    o.xbox = t.xbox;
+  }
+  return list.size();
+#else
+  return 0;
+#endif
+}
+uint32_t aurora_texture_drawn_generation() {
+#ifdef AURORA_ENABLE_GX
+  return aurora::gfx::texture_replacement::drawn_generation();
+#else
+  return 0;
+#endif
+}
+void aurora_texture_replacement_reset_used() {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::reset_used();
+#endif
+}
+void aurora_texture_replacement_highlight(const char* name) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::set_highlight(name != nullptr ? name : "");
+#endif
+}
+void aurora_texture_replacement_reload() {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::request_reload();
+#endif
+}
+void aurora_texture_log(const char* scene) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::texture_replacement::set_texture_log_scene(scene != nullptr ? scene : "");
 #endif
 }
 bool aurora_get_metalfx_spatial() { return aurora::g_metalfxRequested.load(); }

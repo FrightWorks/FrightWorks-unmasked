@@ -5,7 +5,7 @@ generation helpers, parsers with synthetic inputs, project-manifest loading, DOL
 construction, and generic entry-point translation.
 
 The older asset-backed and host-C++-compiler-backed test sources are intentionally retained in
-`Translator.Tests` but excluded in its project file. They mixed MKWii fixtures, several compiler
+`Translator.Tests` but excluded in its project file. They mixed fixtures from an earlier game's data, several compiler
 selection strategies, and private-method reflection checks, which made the normal suite both slow
 and red on a clean Windows setup. They should become a separate opt-in integration project when
 that work is useful again.
@@ -14,7 +14,7 @@ An external generic DOL can be included without adding it to the repository:
 
 ```powershell
 $env:RECOMP_GENERIC_DOL = 'D:\path\to\main.dol'
-dotnet test translator/Translator.sln -c Release
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'; dotnet test translator/Translator.sln -c Release
 ```
 
 The test treats the file as a generic DOL: it reads the DOL entry point, builds a DOL-only image,
