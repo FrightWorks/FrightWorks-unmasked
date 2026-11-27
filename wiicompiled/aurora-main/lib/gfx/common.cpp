@@ -542,6 +542,21 @@ gx::DrawData* get_last_draw_command() {
   return &last.data.draw.gx;
 }
 
+gx::DrawData* get_last_deferred_draw_command() noexcept {
+  if (!has_current_render_pass()) {
+    return nullptr;
+  }
+  auto& deferred = g_renderPasses[g_currentRenderPass].deferred;
+  if (deferred.empty()) {
+    return nullptr;
+  }
+  auto& last = deferred.back();
+  if (last.type != CommandType::Draw || last.data.draw.type != ShaderType::GX) {
+    return nullptr;
+  }
+  return &last.data.draw.gx;
+}
+
 static void push_draw_command(ShaderDrawCommand data) {
   push_command(CommandType::Draw, Command::Data{.draw = data});
   ++g_drawCallCount;

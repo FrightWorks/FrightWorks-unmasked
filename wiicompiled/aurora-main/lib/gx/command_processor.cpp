@@ -2208,6 +2208,9 @@ static PnMtxUsage pn_mtx_usage(const uint8_t* vertices, uint16_t vtxCount,
 
 // Whether the most recent unmerged draw recorded an interpolation snapshot, so a draw merged into it knows there is a snapshot to extend.
 static bool s_lastDrawRecordedInterpolation = false;
+// Whether the most recent unmerged draw was a two-pass cut-out whose solid pass is the last recorded draw and whose
+// fringe pass is the last deferred draw, so a draw merged into the solid pass extends the fringe pass as well.
+static bool s_lastDrawHasFringeTwin = false;
 
 struct CachedIndexTemplate {
   bool valid = false;
@@ -3114,6 +3117,7 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   // Decide admission before allocating anything. The merged path needs only
   // vertices and indices; it must not resolve pipelines or upload arrays.
   // Try to merge with previous draw call
+  DrawData* fringeTwin = nullptr;
   if (!g_gxState.stateDirty && !noMerge && particleDepths.empty()) LIKELY {
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     // Expanded lines/points have different vertex interpretation even with one instance.
@@ -3124,6 +3128,21 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
         uint64_t(lastDraw->vtxCount) +
             vtxCount <= 65536u) LIKELY {
       mergeTarget = lastDraw;
+    }
+    // A two-pass cut-out's fringe pass is a deferred copy of its solid pass. Merging has to extend both, so it only
+    // goes ahead while the fringe pass is still the last deferred draw and covers exactly what the solid pass does.
+    // Most of a level's draws are cut-outs: refusing to merge after them multiplied the draws and the per-draw
+    // vertex-array uploads (W0L1: 270 merges instead of 16,500, 385 MB of uploads a frame instead of 8.5).
+    if (mergeTarget != nullptr && s_lastDrawHasFringeTwin) {
+      fringeTwin = gfx::get_last_deferred_draw_command();
+      if (fringeTwin == nullptr || fringeTwin->vertRange.offset != mergeTarget->vertRange.offset ||
+          fringeTwin->vertRange.size != mergeTarget->vertRange.size ||
+          fringeTwin->idxRange.offset != mergeTarget->idxRange.offset ||
+          fringeTwin->idxRange.size != mergeTarget->idxRange.size || fringeTwin->vtxCount != mergeTarget->vtxCount ||
+          fringeTwin->indexCount != mergeTarget->indexCount || fringeTwin->instanceCount != 1) {
+        mergeTarget = nullptr;
+        fringeTwin = nullptr;
+      }
     }
   }
   if (MergeSuspectsOn()) {
@@ -3158,6 +3177,12 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       lastDraw->idxRange.size += idxRange.size;
       lastDraw->vtxCount += vtxCount;
       lastDraw->indexCount += numIndices;
+      if (fringeTwin != nullptr) {
+        fringeTwin->vertRange = lastDraw->vertRange;
+        fringeTwin->idxRange = lastDraw->idxRange;
+        fringeTwin->vtxCount = lastDraw->vtxCount;
+        fringeTwin->indexCount = lastDraw->indexCount;
+      }
       ++gfx::g_mergedDrawCallCount;
       // Merged into a solid draw (a see-through draw never takes more): it is a solid surface of its own, whose second
       // layer has to be recognised like any other's.
@@ -3455,15 +3480,18 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   } else {
     gfx::push_draw_command(draw);
   }
+  s_lastDrawHasFringeTwin = false;
   if (fringe) {
     // Same geometry again with the fringe pipeline, deferred until the solid scene behind it is drawn (the game
-    // draws cut-outs early: a fringe drawn in place would be painted over by the scenery behind it). The next
-    // draw must not merge into the solid pass: merging extends only the last recorded draw, so the fringe would
-    // miss the merged geometry.
+    // draws cut-outs early: a fringe drawn in place would be painted over by the scenery behind it). A draw merged
+    // into the solid pass extends this copy too (see handle_draw). With the solid pass deferred as well, the next
+    // draw must not merge: the last recorded draw would be some other one.
     draw.pipeline = fringe->first;
     draw.dstAlpha = fringe->second;
     gfx::push_deferred_draw_command(draw);
-    g_gxState.stateDirty = true;
+    const bool solidRecorded = !surfaceLayer && !translucentWorld;
+    s_lastDrawHasFringeTwin = solidRecorded;
+    g_gxState.stateDirty = !solidRecorded;
   } else {
     g_gxState.stateDirty = translucentWorld;
   }

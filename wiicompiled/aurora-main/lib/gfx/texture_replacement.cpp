@@ -97,7 +97,8 @@ std::filesystem::path s_buttonIconRoot;
 const ReplacementIndexEntry s_buttonIconEntry{.buttonIcons = true};
 std::mutex s_buttonIconMutex;
 ButtonIcons s_buttonIcons;          // requested, under s_buttonIconMutex
-bool s_buttonIconsChanged = false;  // under s_buttonIconMutex
+// Written under s_buttonIconMutex; atomic so the per-draw check in take_button_icon_style_change can skip the lock.
+std::atomic_bool s_buttonIconsChanged{false};
 ButtonIcons s_appliedButtonIcons;   // renderer thread
 int s_buttonIconForced = -1;
 absl::flat_hash_map<RuntimeTextureKey, CachedReplacement> s_replacementCache;
@@ -1391,16 +1392,18 @@ void set_button_icons(const ButtonIcons& requested) noexcept {
   std::lock_guard lock(s_buttonIconMutex);
   if (!(s_buttonIcons == icons)) {
     s_buttonIcons = std::move(icons);
-    s_buttonIconsChanged = true;
+    s_buttonIconsChanged.store(true, std::memory_order_release);
   }
 }
 
 // Called on the renderer's thread before textures are resolved: drops the cached atlas of the old icons.
 bool take_button_icon_style_change() noexcept {
+  // Runs for every textured draw: only take the lock when something changed.
+  if (!s_buttonIconsChanged.load(std::memory_order_acquire)) return false;
   {
     std::lock_guard lock(s_buttonIconMutex);
-    if (!s_buttonIconsChanged) return false;
-    s_buttonIconsChanged = false;
+    if (!s_buttonIconsChanged.load(std::memory_order_relaxed)) return false;
+    s_buttonIconsChanged.store(false, std::memory_order_relaxed);
     s_appliedButtonIcons = s_buttonIcons;
   }
   if (s_buttonIconLayout.valid) {
