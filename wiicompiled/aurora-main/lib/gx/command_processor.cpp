@@ -2208,9 +2208,6 @@ static PnMtxUsage pn_mtx_usage(const uint8_t* vertices, uint16_t vtxCount,
 
 // Whether the most recent unmerged draw recorded an interpolation snapshot, so a draw merged into it knows there is a snapshot to extend.
 static bool s_lastDrawRecordedInterpolation = false;
-// Whether the most recent unmerged draw was a two-pass cut-out whose solid pass is the last recorded draw and whose
-// fringe pass is the last deferred draw, so a draw merged into the solid pass extends the fringe pass as well.
-static bool s_lastDrawHasFringeTwin = false;
 
 struct CachedIndexTemplate {
   bool valid = false;
@@ -2290,11 +2287,7 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
 }
 
 // Resolving a pipeline the long way costs a ~2.7KB zero-init, a full populate_pipeline_config, an XXH3 over the whole config and a memcmp against the hash-indexed slot -- roughly 11KB of memory traffic for a result that is almost always identical to the previous draw's.
-// variant: a cut-out draw's solid or fringe pass (apply_cutout_solid / apply_cutout_fringe, gx.cpp). Each variant has
-// its own memo so the passes of one draw don't throw each other's away.
-enum class PipelineVariant : u8 { Game, CutoutSolid, CutoutFringe };
-static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt,
-                                                         PipelineVariant variant = PipelineVariant::Game) {
+static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {
   struct Memo {
     const CachedPipelineState* state = nullptr;
     u32 generation = 0;
@@ -2302,8 +2295,7 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
     GXPrimitive prim = static_cast<GXPrimitive>(0);
     GXVtxFmt fmt = static_cast<GXVtxFmt>(0);
   };
-  static Memo memos[3]{};
-  Memo& memo = memos[static_cast<u8>(variant)];
+  static Memo memo{};
 
   const u32 sampleCount = gfx::get_sample_count();
   const u32 generation = g_gxState.pipelineStateGeneration;
@@ -2314,11 +2306,6 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
 
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt);
-  if (variant == PipelineVariant::CutoutSolid) {
-    apply_cutout_solid(config);
-  } else if (variant == PipelineVariant::CutoutFringe) {
-    apply_cutout_fringe(config);
-  }
   // cached_pipeline_state hands back a reference into a fixed direct-mapped table, so the address stays valid; the entry it points at can only be rewritten by another call to that function, and every such call goes through this miss path and replaces the memo in the same breath.
   const CachedPipelineState& state = cached_pipeline_state(config);
   memo = Memo{
@@ -2843,10 +2830,13 @@ static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t verte
   return gfx::staging_has_space(demand);
 }
 
-// Whether a draw in the current state is part of the world as the two-pass cut-out modes order it.
+// Whether the world is drawn in order (solid scene, then its see-through draws): only while the scene stage
+// (scene_stage.hpp: ambient occlusion, ink outlines, bloom, its views) needs the point between the two.
+static bool world_ordering_enabled() noexcept { return gfx::scene_stage::wanted(); }
+
+// Whether a draw in the current state is part of the ordered world.
 static bool ordered_world_state() noexcept {
-  const auto mode = cutout_mode();
-  return (mode == CutoutMode::TwoPass || mode == CutoutMode::TwoPassAll) && g_gxState.projType == GX_PERSPECTIVE &&
+  return world_ordering_enabled() && g_gxState.projType == GX_PERSPECTIVE &&
          g_gxState.depthCompare && (g_gxState.depthFunc == GX_LESS || g_gxState.depthFunc == GX_LEQUAL);
 }
 
@@ -2872,9 +2862,7 @@ static HashType stage_surface(HashType geometrySignature) noexcept {
 
 static std::vector<float> direct_billboard_depths(GXPrimitive prim, GXVtxFmt fmt,
                                                  const uint8_t* vertices, uint32_t vertexBytes) {
-  const auto mode = cutout_mode();
-  if ((mode != CutoutMode::TwoPass && mode != CutoutMode::TwoPassAll) ||
-      prim != GX_TRIANGLES || g_gxState.projType != GX_PERSPECTIVE ||
+  if (!world_ordering_enabled() || prim != GX_TRIANGLES || g_gxState.projType != GX_PERSPECTIVE ||
       !g_gxState.depthCompare || g_gxState.depthUpdate ||
       (g_gxState.depthFunc != GX_LESS && g_gxState.depthFunc != GX_LEQUAL) ||
       g_gxState.blendMode != GX_BM_BLEND || g_gxState.blendFacSrc != GX_BL_SRCALPHA ||
@@ -3117,7 +3105,6 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   // Decide admission before allocating anything. The merged path needs only
   // vertices and indices; it must not resolve pipelines or upload arrays.
   // Try to merge with previous draw call
-  DrawData* fringeTwin = nullptr;
   if (!g_gxState.stateDirty && !noMerge && particleDepths.empty()) LIKELY {
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     // Expanded lines/points have different vertex interpretation even with one instance.
@@ -3128,21 +3115,6 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
         uint64_t(lastDraw->vtxCount) +
             vtxCount <= 65536u) LIKELY {
       mergeTarget = lastDraw;
-    }
-    // A two-pass cut-out's fringe pass is a deferred copy of its solid pass. Merging has to extend both, so it only
-    // goes ahead while the fringe pass is still the last deferred draw and covers exactly what the solid pass does.
-    // Most of a level's draws are cut-outs: refusing to merge after them multiplied the draws and the per-draw
-    // vertex-array uploads (W0L1: 270 merges instead of 16,500, 385 MB of uploads a frame instead of 8.5).
-    if (mergeTarget != nullptr && s_lastDrawHasFringeTwin) {
-      fringeTwin = gfx::get_last_deferred_draw_command();
-      if (fringeTwin == nullptr || fringeTwin->vertRange.offset != mergeTarget->vertRange.offset ||
-          fringeTwin->vertRange.size != mergeTarget->vertRange.size ||
-          fringeTwin->idxRange.offset != mergeTarget->idxRange.offset ||
-          fringeTwin->idxRange.size != mergeTarget->idxRange.size || fringeTwin->vtxCount != mergeTarget->vtxCount ||
-          fringeTwin->indexCount != mergeTarget->indexCount || fringeTwin->instanceCount != 1) {
-        mergeTarget = nullptr;
-        fringeTwin = nullptr;
-      }
     }
   }
   if (MergeSuspectsOn()) {
@@ -3177,12 +3149,6 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       lastDraw->idxRange.size += idxRange.size;
       lastDraw->vtxCount += vtxCount;
       lastDraw->indexCount += numIndices;
-      if (fringeTwin != nullptr) {
-        fringeTwin->vertRange = lastDraw->vertRange;
-        fringeTwin->idxRange = lastDraw->idxRange;
-        fringeTwin->vtxCount = lastDraw->vtxCount;
-        fringeTwin->indexCount = lastDraw->indexCount;
-      }
       ++gfx::g_mergedDrawCallCount;
       // Merged into a solid draw (a see-through draw never takes more): it is a solid surface of its own, whose second
       // layer has to be recognised like any other's.
@@ -3360,26 +3326,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
   }
 
-  const CachedPipelineState* pipelineStatePtr = &resolve_pipeline_state(prim, fmt);
-  resolve_sampled_textures(pipelineStatePtr->shaderInfo);
-  // Only the resolved textures tell whether an HD replacement is drawn. The cut-out variants change the alpha test and
-  // depth write only, so the textures, bind groups and uniforms are the same for every pass.
-  // The fringe pass's pipeline is copied out at once: a later resolve can rewrite the cache slot it lives in.
-  std::optional<std::pair<decltype(pipelineStatePtr->ref), decltype(pipelineStatePtr->dstAlpha)>> fringe;
-  switch (cutout_passes(pipelineStatePtr->shaderInfo)) {
-  case CutoutPasses::Cut:
-    pipelineStatePtr = &resolve_pipeline_state(prim, fmt, PipelineVariant::CutoutSolid);
-    break;
-  case CutoutPasses::TwoPass: {
-    const auto& fringeState = resolve_pipeline_state(prim, fmt, PipelineVariant::CutoutFringe);
-    fringe.emplace(fringeState.ref, fringeState.dstAlpha);
-    pipelineStatePtr = &resolve_pipeline_state(prim, fmt, PipelineVariant::CutoutSolid);
-    break;
-  }
-  default:
-    break;
-  }
-  const auto& pipelineState = *pipelineStatePtr;
+  const auto& pipelineState = resolve_pipeline_state(prim, fmt);
+  resolve_sampled_textures(pipelineState.shaderInfo);
   const auto& info = pipelineState.shaderInfo;
 
   const auto bindGroups = build_bind_groups(info);
@@ -3431,8 +3379,6 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       .dstAlpha = pipelineState.dstAlpha,
       .emitsLight = samples_light_texture(info),
   };
-  const auto cutoutMode = cutout_mode();
-  const bool enhancedCutouts = cutoutMode == CutoutMode::TwoPass || cutoutMode == CutoutMode::TwoPassAll;
   const bool orderedWorld = ordered_world_state();
   // The game also draws blended surfaces after its particles with depth write on and no alpha test, such as the faded
   // door and wall pieces between the camera and the room at the start of i004. They keep that place in the tail: drawn
@@ -3442,7 +3388,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                   g_gxState.alphaCompare.comp1 == GX_ALWAYS && gfx::has_pending_translucent_draws();
   const bool translucentWorld = orderedWorld && (!g_gxState.depthUpdate || lateBlendedSurface);
   // With the scene stage in use, a see-through draw of a surface already drawn solid this frame (the game's two-layer
-  // materials) is the solid surface's second layer: it is drawn with the cut-out fringes, before the stage, instead of
+  // materials) is the solid surface's second layer: it is drawn after the solid scene, before the stage, instead of
   // in the see-through tail. Late blended surfaces (which write depth) stay in the tail.
   bool surfaceLayer = false;
   if (orderedWorld && geometrySignature != 0 && particleDepths.empty() && gfx::scene_stage::wanted()) {
@@ -3453,12 +3399,12 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       surfaceLayer = gfx::scene_stage::is_solid_surface(surface);
     }
   }
-  if (!orderedWorld && (enhancedCutouts || !g_gxState.depthCompare ||
-                        !g_gxState.depthUpdate || g_gxState.depthFunc == GX_ALWAYS)) {
+  // Anything outside the ordered world (2D, no depth test) ends the world: its solid scene, the stage and its
+  // see-through tail are drawn first.
+  if (!orderedWorld && world_ordering_enabled()) {
     gfx::flush_deferred_draws();
   }
-  // The game queues alpha-tested grass after particles. Finish that solid geometry and its
-  // fringes before blending clouds over it; retain submission order within the translucent tail.
+  // Retain submission order within the translucent tail.
   if (surfaceLayer) {
     gfx::push_deferred_draw_command(draw, gfx::DeferredDrawKind::SurfaceLayer);
   } else if (translucentWorld) {
@@ -3480,21 +3426,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   } else {
     gfx::push_draw_command(draw);
   }
-  s_lastDrawHasFringeTwin = false;
-  if (fringe) {
-    // Same geometry again with the fringe pipeline, deferred until the solid scene behind it is drawn (the game
-    // draws cut-outs early: a fringe drawn in place would be painted over by the scenery behind it). A draw merged
-    // into the solid pass extends this copy too (see handle_draw). With the solid pass deferred as well, the next
-    // draw must not merge: the last recorded draw would be some other one.
-    draw.pipeline = fringe->first;
-    draw.dstAlpha = fringe->second;
-    gfx::push_deferred_draw_command(draw);
-    const bool solidRecorded = !surfaceLayer && !translucentWorld;
-    s_lastDrawHasFringeTwin = solidRecorded;
-    g_gxState.stateDirty = !solidRecorded;
-  } else {
-    g_gxState.stateDirty = translucentWorld;
-  }
+  g_gxState.stateDirty = translucentWorld;
   if (flatSave) {
     g_gxState.tevStages[0] = flatSave->st0;
     g_gxState.numTevStages = flatSave->numTev;

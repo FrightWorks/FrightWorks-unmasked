@@ -20,7 +20,7 @@ namespace aurora::gfx::bloom {
 // them, but not the see-through surfaces the game draws later with depth writes, such as the faded walls between the
 // camera and the room at the start of i004). That is blurred wide at falling sizes and added there, before the tail is
 // drawn: see-through surfaces in front of a light (glass, mist, smoke) then cover its glow as they cover the light. A
-// frame with no scene stage (the "game" and "cut" cut-out modes, a frame submitted in parts) has no bloom.
+// frame with no scene stage (nothing see-through, a frame submitted in parts) has no bloom.
 
 // 0 = off, 1 = full. Clamped to [0, 1]; takes effect at the next frame.
 void set_strength(float strength) noexcept;

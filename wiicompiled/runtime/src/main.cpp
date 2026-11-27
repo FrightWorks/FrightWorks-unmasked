@@ -1671,7 +1671,6 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.sharpFont = RuntimeConfigFile::SharpFont(true);
         // The flat pause menu and map icons redrawn sharp where nothing replaces them ([video] sharp_icons).
         auroraConfig.sharpIcons = RuntimeConfigFile::SharpIcons(true);
-        aurora_set_cutout_mode(RuntimeConfigFile::CutoutMode());
         // No vsync knob: aurora always configures a non-blocking present mode.
         auroraConfig.desiredBackend = BACKEND_AUTO;
         // GPU driver workarounds: picked from the graphics adapter unless the player forced them.

@@ -409,12 +409,10 @@ template <typename DrawData>
 void push_draw_command(DrawData data);
 template <typename DrawData>
 DrawData* get_last_draw_command();
-enum class DeferredDrawKind : uint8_t { Cutout, SurfaceLayer, Translucent };
-// Preserve each draw's viewport/scissor. Finish cut-out fringes before translucent world draws;
-// a clear, overlay or render-pass boundary ends the deferred scene.
-void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind kind = DeferredDrawKind::Cutout);
-// The last deferred (cut-out fringe or surface layer) draw of the current pass, if the last deferred command is one.
-gx::DrawData* get_last_deferred_draw_command() noexcept;
+enum class DeferredDrawKind : uint8_t { SurfaceLayer, Translucent };
+// While the world is drawn in order (the scene stage is in use): surface layers, then translucent world draws, after
+// the solid scene. Each keeps its viewport/scissor. A clear, overlay or render-pass boundary ends the deferred scene.
+void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind kind);
 void flush_deferred_draws();
 bool has_pending_translucent_draws() noexcept;
 

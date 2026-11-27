@@ -234,9 +234,7 @@ constexpr std::array particlePaths{
     ParticlePath::Bridge, ParticlePath::Immediate,
     ParticlePath::ImmediateThenBridge, ParticlePath::BridgeThenImmediate};
 
-Pixels run_alpha_order(gx::CutoutMode mode, unsigned variant = 0,
-                       ParticlePath path = ParticlePath::Bridge) {
-  gx::set_cutout_mode(mode);
+Pixels run_alpha_order(unsigned variant = 0, ParticlePath path = ParticlePath::Bridge) {
   gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
   require(gfx::begin_frame(), "Alpha-order frame begin failed");
   gfx::push_draw_command(gfx::clear::DrawData{
@@ -726,7 +724,6 @@ void draw_same_state_frame(bool settingChanged) {
 enum class StageScene { Basic, Crease, Layer, SplitBetween, SplitTail, SplitMidTail, LateLayer, MergedLayers, NoCamera, ThinThing, Ridge };
 void draw_stage_frame(StageScene scene = StageScene::Basic) {
   const bool crease = scene == StageScene::Crease;
-  gx::set_cutout_mode(gx::CutoutMode::TwoPassAll);
   gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
   require(gfx::begin_frame(), "Scene stage frame begin failed");
   gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
@@ -900,7 +897,6 @@ enum class BloomExtra { None, Cover, TailRight };
 // with `lightTexture`, the right one (40 to 55) with `plainTexture`, then a faint see-through quad in a corner (so the
 // frame has a see-through tail, and a scene stage), and `extra`.
 void draw_bloom_frame(GXTexObj& lightTexture, GXTexObj& plainTexture, BloomExtra extra = BloomExtra::None) {
-  gx::set_cutout_mode(gx::CutoutMode::TwoPassAll);
   gx::g_gxState.clearColor = {0.f, 0.f, 0.f, 1.f};
   require(gfx::begin_frame(), "Bloom frame begin failed");
   gfx::push_draw_command(gfx::clear::DrawData{.pipeline = gfx::pipeline_ref(gfx::clear::PipelineConfig{}),
@@ -1524,70 +1520,25 @@ int main(int argc, char** argv) {
     draw_motion_frame(0.f);
     require(!webgpu::g_motionVectors.texture, "Motion vector targets kept after blur was turned off");
     std::printf("Actual Aurora blurred picture copied for capture\n");
-    for (const auto mode : {gx::CutoutMode::TwoPass, gx::CutoutMode::TwoPassAll}) {
-      check_alpha_pixel(run_alpha_order(mode), 4, {127, 128, 0});
-      check_alpha_pixel(run_alpha_order(mode, 1), 4, {255, 0, 0});
-      check_alpha_pixel(run_alpha_order(mode, 3), 4, {63, 64, 128});
-      check_alpha_pixel(run_alpha_order(mode, 25), 4, {0, 128, 127});
-      check_alpha_pixel(run_alpha_order(mode, 26), 4, {0, 128, 127});
-      check_alpha_pixel(run_alpha_order(mode, 27), 4, {127, 128, 0});
-      for (unsigned variant : {4, 5}) {
-        const auto pixels = run_alpha_order(mode, variant);
-        check_alpha_pixel(pixels, 4, {127, 128, 0});
-        check_alpha_pixel(pixels, 12, {255, 0, 0});
-      }
-      for (unsigned variant : {6, 7, 8, 9, 10})
-        check_alpha_pixel(run_alpha_order(mode, variant), 4, {255, 255, 255});
-      for (const auto path : particlePaths) {
-        for (unsigned variant : {11, 12, 13, 14, 15, 16, 17, 18, 19, 20}) {
-          const auto pixels = run_alpha_order(mode, variant, path);
-          const auto left = variant == 12 || variant == 14 ? std::array{127, 128, 0} :
-                            variant == 13 ? std::array{95, 96, 192} :
-                            variant == 17 ? std::array{63, 64, 160} :
-                            variant == 18 ? std::array{127, 128, 128} : std::array{63, 64, 128};
-          const auto right = variant == 12 ? std::array{32, 160, 95} :
-                             variant == 13 ? std::array{64, 80, 207} :
-                             variant == 18 ? std::array{64, 192, 255} :
-                             variant >= 14 && variant <= 17 ? std::array{32, 64, 191} : std::array{16, 80, 175};
-          check_alpha_pixel(pixels, 4, left);
-          check_alpha_pixel(pixels, 12, right);
-        }
-        for (unsigned variant : {21, 22, 23, 24}) {
-          const auto pixels = run_alpha_order(mode, variant, path);
-          const auto left = variant == 22 ? std::array{95, 32, 128} :
-                            variant == 23 ? std::array{0, 127, 128} :
-                            variant == 24 ? std::array{127, 0, 128} : std::array{63, 64, 128};
-          const auto right = variant == 22 ? std::array{24, 56, 199} :
-                             variant == 23 ? std::array{0, 127, 128} :
-                             variant == 24 ? std::array{32, 32, 223} : std::array{16, 80, 175};
-          check_alpha_pixel(pixels, 4, left);
-          check_alpha_pixel(pixels, 12, right);
-          if (variant == 24) check_alpha_pixel(pixels, 8, {48, 38, 173});
-        }
+    // The game's own alpha test: cut-outs are drawn as the game sets them up, in submission order.
+    check_alpha_pixel(run_alpha_order(), 4, {255, 0, 0});
+    for (unsigned variant : {25, 26, 27})
+      check_alpha_pixel(run_alpha_order(variant), 4, {0, 128, 127});
+    for (const auto path : particlePaths) {
+      const auto particles = run_alpha_order(11, path);
+      check_alpha_pixel(particles, 4, {63, 64, 128});
+      check_alpha_pixel(particles, 12, {32, 64, 191});
+      for (unsigned variant : {21, 22, 23, 24}) {
+        const auto pixels = run_alpha_order(variant, path);
+        check_alpha_pixel(pixels, 4, variant == 22 ? std::array{95, 32, 128} :
+                                   variant == 23 ? std::array{0, 127, 128} :
+                                   variant == 24 ? std::array{127, 0, 128} : std::array{63, 64, 128});
+        check_alpha_pixel(pixels, 12, variant == 22 ? std::array{32, 48, 207} :
+                                    variant == 23 ? std::array{32, 95, 160} :
+                                    variant == 24 ? std::array{32, 32, 223} : std::array{32, 64, 191});
       }
     }
-    check_alpha_pixel(run_alpha_order(gx::CutoutMode::TwoPassAll, 2), 4, {32, 128, 95});
-    for (const auto mode : {gx::CutoutMode::Game, gx::CutoutMode::Cut}) {
-      check_alpha_pixel(run_alpha_order(mode), 4, {255, 0, 0});
-      for (unsigned variant : {25, 26, 27})
-        check_alpha_pixel(run_alpha_order(mode, variant), 4, {0, 128, 127});
-      for (const auto path : particlePaths) {
-        const auto particles = run_alpha_order(mode, 11, path);
-        check_alpha_pixel(particles, 4, {63, 64, 128});
-        check_alpha_pixel(particles, 12, {32, 64, 191});
-        for (unsigned variant : {21, 22, 23, 24}) {
-          const auto pixels = run_alpha_order(mode, variant, path);
-          check_alpha_pixel(pixels, 4, variant == 22 ? std::array{95, 32, 128} :
-                                     variant == 23 ? std::array{0, 127, 128} :
-                                     variant == 24 ? std::array{127, 0, 128} : std::array{63, 64, 128});
-          check_alpha_pixel(pixels, 12, variant == 22 ? std::array{32, 48, 207} :
-                                      variant == 23 ? std::array{32, 95, 160} :
-                                      variant == 24 ? std::array{32, 32, 223} : std::array{32, 64, 191});
-        }
-      }
-    }
-    gx::set_cutout_mode(gx::CutoutMode::TwoPassAll);
-    std::puts("Actual Aurora late foliage, fringe/cloud blending, translucent order, viewport/scissor and barriers passed");
+    std::puts("Actual Aurora alpha test, translucent order, viewport/scissor and barriers passed");
     const auto control = run(0);
     for (unsigned band = 0; band < 4; ++band) {
       const auto tile = band * 4 * 64;

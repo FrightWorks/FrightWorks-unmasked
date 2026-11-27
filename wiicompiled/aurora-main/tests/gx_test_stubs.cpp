@@ -127,11 +127,6 @@ void schedule(void*, uint32_t, uint32_t, GXTexFmt, TextureHandle, uint32_t) noex
 namespace aurora::gx {
 GXState::CopyTextureRef* find_copy_texture_for_texobj(const GXTexObj_&) noexcept { return nullptr; }
 std::vector<PatchTarget> find_patch_targets(const void*) { return {}; }
-// The game's own alpha test: no draw is split into solid and fringe passes here.
-CutoutMode cutout_mode() noexcept { return CutoutMode::Game; }
-CutoutPasses cutout_passes(const ShaderInfo&) noexcept { return CutoutPasses::None; }
-void apply_cutout_solid(PipelineConfig&) noexcept {}
-void apply_cutout_fringe(PipelineConfig&) noexcept {}
 } // namespace aurora::gx
 namespace aurora::gfx {
 bool add_resolve_patch(const TextureHandle&, TextureHandle, uint32_t, uint32_t, uint32_t, uint32_t) { return false; }
@@ -401,7 +396,7 @@ void push_draw_command<gx::DrawData>(gx::DrawData data) {
     s_lastGxDraw = std::move(data);
   }
 }
-// A deferred draw (translucent tail, cut-out fringe) is recorded like any other.
+// A deferred draw (translucent tail, surface layer) is recorded like any other.
 void push_deferred_draw_command(const gx::DrawData& data, DeferredDrawKind) {
   if (s_trackDrawCommands) {
     s_lastGxDraw = data;

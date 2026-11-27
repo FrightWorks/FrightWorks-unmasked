@@ -8,12 +8,13 @@ namespace aurora::gfx::scene_stage {
 // (the world's second, blended pass, fog, particles, glow) have not been drawn yet, nor its HUD. Effects that belong
 // to the solid scene run there, on the EFB's colour, reading its depth: ambient occlusion, later lighting.
 //
-// The game never marks that point, so it is taken from the cut-out modes' tails: when they are flushed (common.cpp
-// flush_deferred_draws, or at the next copy or the frame's end), the cut-out fringes and the solid surfaces' second
-// layers stay in the pass, the pass ends, the stage runs, and the see-through draws start a new pass that keeps the
-// colour and depth. When a frame flushes more than once, the stage runs at the last flush. A frame with nothing held
-// back (cut-out mode "game" or "cut", or nothing see-through or cut out) has no stage, and neither has a frame submitted
-// in parts (common.cpp end_batch_impl): it shows without the stage's effects, otherwise the same.
+// The game never marks that point, so while the stage is wanted the world is drawn in order (command_processor.cpp
+// ordered_world_state): its see-through draws are held back. When they are flushed (common.cpp flush_deferred_draws,
+// or at the next copy or the frame's end), the solid surfaces' second layers stay in the pass, the pass ends, the stage
+// runs, and the see-through draws start a new pass that keeps the colour and depth. When a frame flushes more than
+// once, the stage runs at the last flush. A frame with nothing held back (nothing see-through) has no stage, and
+// neither has a frame submitted in parts (common.cpp end_batch_impl): it shows without the stage's effects, otherwise
+// the same.
 
 // Whether anything uses the stage (its own effects, or the bloom: bloom.hpp): with nothing, the pass is not split and
 // nothing is recorded.

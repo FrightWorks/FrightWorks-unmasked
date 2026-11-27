@@ -237,12 +237,6 @@ uint32_t aurora_get_monitors(AuroraMonitor* monitors, uint32_t maxCount);
 // The monitor fullscreen goes to: an AuroraMonitor id, or "auto" for the one the window is on. A monitor that is gone
 // falls back to the only connected one of the same model, else the main monitor. Applied at once when fullscreen.
 void aurora_set_fullscreen_monitor(const char* id);
-// Cut-out draws ("alpha > 0" + depth write: leaves, grass, webs): 0 = the game's own test, 1 = alpha > 127 for HD
-// replacements, 2 = two passes for HD replacements (solid part with depth write, faint part blended without),
-// 3 = two passes for every texture (originals too; the default). Takes effect at the next draw.
-#define AURORA_HAS_CUTOUT_MODE 1
-void aurora_set_cutout_mode(int mode);
-int aurora_get_cutout_mode();
 // Motion vectors: where every surface was last frame, per pixel, made while motion blur or the view needs them.
 // Motion blur: how many frames of motion each pixel is smeared over (0.5 = a film camera's 180-degree shutter, up to
 // 4), 0 = off; AuroraConfig::motionBlur at start. The view shows the vectors: 0 = off, 1 = motion

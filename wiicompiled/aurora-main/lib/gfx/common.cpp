@@ -184,7 +184,8 @@ struct RenderPass {
   // failing every subsequent depth test and making whatever's drawn into it vanish).
   float clearDepthValue = gx::UseReversedZ ? 0.f : 1.f;
   CommandList commands;
-  // Solid scene, cut-out fringes, then translucent world draws. Explicit barriers flush both tails.
+  // Solid scene, surface layers, then translucent world draws (only while the world is drawn in order). Explicit
+  // barriers flush both tails.
   CommandList deferred;
   CommandList translucent;
   // A solid surface's second layer is in `deferred`: it was in the see-through tail until the scene stage moved it, so
@@ -542,21 +543,6 @@ gx::DrawData* get_last_draw_command() {
   return &last.data.draw.gx;
 }
 
-gx::DrawData* get_last_deferred_draw_command() noexcept {
-  if (!has_current_render_pass()) {
-    return nullptr;
-  }
-  auto& deferred = g_renderPasses[g_currentRenderPass].deferred;
-  if (deferred.empty()) {
-    return nullptr;
-  }
-  auto& last = deferred.back();
-  if (last.type != CommandType::Draw || last.data.draw.type != ShaderType::GX) {
-    return nullptr;
-  }
-  return &last.data.draw.gx;
-}
-
 static void push_draw_command(ShaderDrawCommand data) {
   push_command(CommandType::Draw, Command::Data{.draw = data});
   ++g_drawCallCount;
@@ -623,7 +609,7 @@ void flush_deferred_draws() {
   pass.deferredViewport.reset();
   pass.deferredScissor.reset();
   if (!g_inOffscreen && scene_stage::wanted()) {
-    // The solid scene, its cut-out fringes and its surfaces' second layers are drawn: the scene stage runs here, so
+    // The solid scene and its surfaces' second layers are drawn: the scene stage runs here, so
     // the see-through tail goes into a new pass that keeps the colour and depth (its draws carry their own viewport
     // and scissor).
     RenderPass continuation{

@@ -2656,19 +2656,6 @@ float aurora_get_motion_vector_view_scale() {
   return 16.f;
 #endif
 }
-void aurora_set_cutout_mode(int mode) {
-#ifdef AURORA_ENABLE_GX
-  if (mode >= 0 && mode <= static_cast<int>(aurora::gx::CutoutMode::TwoPassAll))
-    aurora::gx::set_cutout_mode(static_cast<aurora::gx::CutoutMode>(mode));
-#endif
-}
-int aurora_get_cutout_mode() {
-#ifdef AURORA_ENABLE_GX
-  return static_cast<int>(aurora::gx::cutout_mode());
-#else
-  return 0;
-#endif
-}
 void aurora_set_metalfx_spatial(bool enabled) { aurora::g_metalfxRequested.store(enabled); }
 void aurora_set_button_icons(int family, const char* const buttons[4]) {
 #ifdef AURORA_ENABLE_GX
