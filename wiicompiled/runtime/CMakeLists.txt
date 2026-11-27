@@ -427,6 +427,14 @@ target_include_directories(recomp_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_
 target_compile_features(recomp_nand_save_tests PRIVATE cxx_std_17)
 add_test(NAME recomp_nand_save_tests COMMAND recomp_nand_save_tests)
 
+add_executable(recomp_audio_poll_clock_tests "${CMAKE_CURRENT_LIST_DIR}/tests/audio_poll_clock_tests.cpp")
+target_compile_features(recomp_audio_poll_clock_tests PRIVATE cxx_std_17)
+add_test(NAME recomp_audio_poll_clock_tests COMMAND recomp_audio_poll_clock_tests)
+
+add_executable(no100f_ax_address_sync_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no100f_ax_address_sync_tests.cpp")
+target_compile_features(no100f_ax_address_sync_tests PRIVATE cxx_std_17)
+add_test(NAME no100f_ax_address_sync_tests COMMAND no100f_ax_address_sync_tests)
+
 add_executable(recomp_nand_settings_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_settings_tests.cpp")
 find_package(Threads REQUIRED)
 target_link_libraries(recomp_nand_settings_tests PRIVATE Threads::Threads)
