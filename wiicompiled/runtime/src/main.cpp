@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <aurora/window_owner.hpp>
+#include "audio_backend.h"
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -54,12 +56,19 @@
 #endif
 #endif
 #include <unistd.h>
+#if !defined(__ANDROID__)
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#define RECOMP_HAS_POSIX_BACKTRACE 1
+#endif
 #endif
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
 
 #include "netplay_ui.h"
+#include "no100f_light_textures.h"
 #include "netplay_start.h"
 #include "netplay_session.h"
 #include "frame_input.h"
@@ -80,8 +89,12 @@
 #include "hle_stubs.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
+#include "build_info.h"
+#include "overlay_theme.h"
 #include "runtime_product.h"
 #include "recomp_mod_loader.h"
+#include "system_report.h"
+#include "log_privacy.h"
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <dolphin/gx/GXAurora.h>
@@ -204,6 +217,9 @@ struct ProcessTranscriptState {
     bool enabled = false;
     std::filesystem::path path;
     std::ofstream file;
+    // Logs/latest.log: the same transcript at a fixed place, for tools that take the newest .log in the Logs folder
+    // without looking into the run folders (RecompLauncher attaches it to the crash report a player sends).
+    std::ofstream latest;
     std::mutex fileMutex;
     std::atomic_bool initialized{false};
     int savedStdoutFd = -1;
@@ -261,7 +277,7 @@ const std::filesystem::path& GetRunLogDirectory() {
         const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
         std::ostringstream name;
-        name << (RuntimeProduct::IsRetroRewind() ? "retro_rewind" : "base")
+        name << (RuntimeProduct::IsModProduct() ? "mod_product" : "base")
              << "_" << secs << "_pid" << pid;
         const std::filesystem::path directory = logRoot / name.str();
         std::filesystem::create_directories(directory, ec);
@@ -283,10 +299,17 @@ void WriteProcessTranscriptChunk(ProcessTranscriptState& state, const char* data
     std::lock_guard<std::mutex> lock(state.fileMutex);
     state.file.write(data, static_cast<std::streamsize>(size));
     state.file.flush();
+    if (state.latest) {
+        state.latest.write(data, static_cast<std::streamsize>(size));
+        state.latest.flush();
+    }
 }
 
 void PumpTranscriptPipe(ProcessTranscriptState& state, int readFd, int mirrorFd) {
     std::array<char, 4096> buffer{};
+    // console.log gets whole lines with the home folder rewritten (log_privacy.h); a line is held until its end
+    // arrives, or until the pipe is drained (a prompt without a newline, the last words before a crash).
+    std::string pending;
     for (;;) {
 #if defined(_WIN32)
         const int bytesRead = _read(readFd, buffer.data(), static_cast<unsigned int>(buffer.size()));
@@ -316,7 +339,19 @@ void PumpTranscriptPipe(ProcessTranscriptState& state, int readFd, int mirrorFd)
             }
         }
 
-        WriteProcessTranscriptChunk(state, buffer.data(), static_cast<size_t>(bytesRead));
+        pending.append(buffer.data(), static_cast<size_t>(bytesRead));
+        const bool drained = static_cast<size_t>(bytesRead) < buffer.size();
+        const size_t end = drained ? pending.size() : pending.rfind('\n') + 1;  // npos + 1 == 0: no whole line yet
+        if (end != 0) {
+            std::string lines = pending.substr(0, end);
+            pending.erase(0, end);
+            LogPrivacy::Apply(lines, LogPrivacy::CurrentRules());
+            WriteProcessTranscriptChunk(state, lines.data(), lines.size());
+        }
+    }
+    if (!pending.empty()) {
+        LogPrivacy::Apply(pending, LogPrivacy::CurrentRules());
+        WriteProcessTranscriptChunk(state, pending.data(), pending.size());
     }
 }
 
@@ -457,6 +492,8 @@ void InitializeProcessTranscript(int argc, char** argv) {
 
     state.enabled = true;
     state.path = path;
+    // A second game running at once takes it over; console.log in the run folder stays complete.
+    state.latest.open(GetDefaultRuntimeLogDirectory() / "latest.log", std::ios::out | std::ios::trunc | std::ios::binary);
 
 #if defined(_WIN32)
     const unsigned long pid = ::GetCurrentProcessId();
@@ -466,22 +503,20 @@ void InitializeProcessTranscript(int argc, char** argv) {
 
     const std::string setupVersion = ReadInstalledSetupVersion();
 
-    {
-        std::lock_guard<std::mutex> lock(state.fileMutex);
-        state.file << "[runtime] WiiCompiled "
-                   << (setupVersion.empty() ? "version unknown" : setupVersion) << "\n";
-        state.file << "[runtime] process transcript started\n";
-        state.file << "[runtime] pid=" << pid << "\n";
-        state.file << "[runtime] argv=";
-        for (int i = 0; i < argc; ++i) {
-            if (i != 0) {
-                state.file << ' ';
-            }
-            state.file << argv[i];
+    std::ostringstream header;
+    header << "[runtime] WiiCompiled " << (setupVersion.empty() ? "version unknown" : setupVersion) << "\n";
+    header << "[runtime] process transcript started\n";
+    header << "[runtime] pid=" << pid << "\n";
+    std::string args;
+    for (int i = 0; i < argc; ++i) {
+        if (i != 0) {
+            args += ' ';
         }
-        state.file << "\n";
-        state.file.flush();
+        args += argv[i];
     }
+    header << "[runtime] argv=" << LogPrivacy::Sanitized(std::move(args)) << "\n";
+    const std::string headerText = header.str();
+    WriteProcessTranscriptChunk(state, headerText.data(), headerText.size());
 
     state.savedStdoutFd = DuplicateFileDescriptor(GetFileDescriptor(stdout));
     state.savedStderrFd = DuplicateFileDescriptor(GetFileDescriptor(stderr));
@@ -522,6 +557,7 @@ void InitializeProcessTranscript(int argc, char** argv) {
         }
         state.enabled = false;
         state.file.close();
+        state.latest.close();
     };
 
     if (!InstallTranscriptPipe(state.stdoutPipeReadFd, state.stdoutPipeWriteFd, GetFileDescriptor(stdout)) ||
@@ -538,9 +574,13 @@ void InitializeProcessTranscript(int argc, char** argv) {
     });
 }
 
-void ShutdownProcessTranscript() {
+// how: why the game is ending, for the transcript's last line. A log without that line ended some other way: killed,
+// out of memory, power lost, or a crash (those leave a crash_*.txt beside it).
+void ShutdownProcessTranscript(const char* how) {
     auto& state = GetProcessTranscriptState();
-    if (!state.enabled) {
+    // Once: a window close and a game reset can race to end the run.
+    static std::atomic_flag s_ending = ATOMIC_FLAG_INIT;
+    if (!state.enabled || s_ending.test_and_set()) {
         return;
     }
 
@@ -589,14 +629,20 @@ void ShutdownProcessTranscript() {
         state.savedStderrFd = -1;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(state.fileMutex);
-        state.file << "\n[runtime] process transcript ended\n";
-        state.file.flush();
-    }
+    const std::string ended = std::string("\n[runtime] process transcript ended: ") + how + "\n";
+    WriteProcessTranscriptChunk(state, ended.data(), ended.size());
     state.file.close();
+    state.latest.close();
     state.enabled = false;
 }
+
+} // namespace
+
+void EndProcessTranscriptForExit(const char* how) {
+    ShutdownProcessTranscript(how);
+}
+
+namespace {
 
 // The one host stack walker. Every caller - the CRT report hook, the fatal log
 // and the stderr crash dump - goes through this, so the log and the console see
@@ -702,6 +748,62 @@ std::string FormatHostStackTrace(unsigned framesToSkip) {
         out << ")\n";
     }
     return out.str();
+#elif defined(RECOMP_HAS_POSIX_BACKTRACE)
+    // Release builds export few symbols, so most frames name only their module: "module+0x..." is the offset to look
+    // up in that same build, which keeps its symbol table (llvm-symbolizer --obj=<FrightWorks Game> 0x...). Module
+    // file names only, no folders (those hold the player's user name).
+    void* frames[64]{};
+    const int captured = ::backtrace(frames, static_cast<int>(std::size(frames)));
+    std::ostringstream out;
+    if (captured <= static_cast<int>(framesToSkip)) {
+        out << "[runtime] host stack trace unavailable (backtrace returned " << captured << ")\n";
+        return out.str();
+    }
+    out << "[runtime] host stack trace (most recent call first):\n";
+    for (int i = static_cast<int>(framesToSkip); i < captured; ++i) {
+        const auto addr = reinterpret_cast<uintptr_t>(frames[i]);
+        std::string module = "?";
+        std::string symbolName = "?";
+        uintptr_t moduleBase = 0;
+        uintptr_t symbolDisp = 0;
+        uint32_t ppcAddress = 0;
+        Dl_info info{};
+        if (dladdr(frames[i], &info) != 0) {
+            if (info.dli_fname != nullptr && *info.dli_fname != '\0') {
+                module = std::filesystem::path(info.dli_fname).filename().string();
+            }
+            moduleBase = reinterpret_cast<uintptr_t>(info.dli_fbase);
+            if (info.dli_sname != nullptr) {
+                int status = 0;
+                char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+                symbolName = status == 0 && demangled != nullptr ? demangled : info.dli_sname;
+                std::free(demangled);
+                symbolDisp = addr - reinterpret_cast<uintptr_t>(info.dli_saddr);
+            }
+        }
+        if (symbolName == "?") {
+            // The registry gives the nearest translated function below the address: right for translated code, only a
+            // hint for the runtime's own (that is what "near" says). The module offset is the exact reference.
+            if (auto translated = TranslatedFunctionRegistry::FindByHostAddress(addr)) {
+                if (translated->name != nullptr && *translated->name != '\0') {
+                    symbolName = std::string("near ") + translated->name;
+                    symbolDisp = addr - reinterpret_cast<uintptr_t>(translated->entryPoint);
+                }
+                ppcAddress = translated->address;
+            }
+        }
+        out << "  [" << std::setw(2) << std::setfill('0') << i - static_cast<int>(framesToSkip) << std::setfill(' ')
+            << "] " << module << "!" << symbolName << " + 0x" << std::hex << std::uppercase << symbolDisp << " (0x"
+            << addr;
+        if (moduleBase != 0) {
+            out << ", module+0x" << (addr - moduleBase);
+        }
+        if (ppcAddress != 0) {
+            out << ", PPC:0x" << std::setw(8) << std::setfill('0') << ppcAddress << std::setfill(' ');
+        }
+        out << std::dec << std::nouppercase << ")\n";
+    }
+    return out.str();
 #else
     (void)framesToSkip;
     return {};
@@ -727,7 +829,7 @@ void WriteFatalLogImpl(std::string_view reason, std::string_view extraDetails = 
     out << "[runtime] timestamp(seconds): " << nowSecs << std::endl;
     out << "[runtime] entry: " << (g_lastEntryLabel.empty() ? "<unknown>" : g_lastEntryLabel) << std::endl;
     if (!extraDetails.empty()) {
-        out << "[runtime] details: " << extraDetails << std::endl;
+        out << "[runtime] details: " << LogPrivacy::Sanitized(std::string(extraDetails)) << std::endl;
     }
     if (missingGuestTarget) {
         out << "[runtime] guest jump target: 0x" << std::hex << std::uppercase
@@ -771,7 +873,7 @@ void SetRuntimeExitCodeImpl(int code) {
 namespace {
 
 void DumpHostStackTrace() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(RECOMP_HAS_POSIX_BACKTRACE)
     static std::atomic_flag s_inProgress = ATOMIC_FLAG_INIT;
     if (s_inProgress.test_and_set()) {
         return;
@@ -800,9 +902,9 @@ void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) 
     if (g_fatalPopupShown.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    // RUNTIME_NO_POPUP: automated runs (tools/level-sweep.ps1) log the fatal error instead of opening a window.
-    if (std::getenv("SPM_MAP_SWEEP_FILE") || std::getenv("RUNTIME_NO_POPUP")) {
-        RT_LOGF(RT_TAG_RUNTIME, "[spmsweep] fatal %.*s: %.*s\n", static_cast<int>(category.size()), category.data(),
+    // NO100F_NO_POPUP / RUNTIME_NO_POPUP: automated runs (tools/level-sweep.py) log the fatal error instead of opening a window.
+    if (std::getenv("NO100F_NO_POPUP") || std::getenv("RUNTIME_NO_POPUP")) {
+        RT_LOGF(RT_TAG_RUNTIME, "[fatal] %.*s: %.*s\n", static_cast<int>(category.size()), category.data(),
                 static_cast<int>(details.size()), details.data());
         return;
     }
@@ -1177,7 +1279,14 @@ void ReportUnhandledSignalFault(int sig, void* faultAddress) {
 }
 
 void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
-    void* faultAddress = info != nullptr ? info->si_addr : nullptr;
+    // si_addr means something only when the CPU raised the signal (si_code > 0); a signal another process or raise()
+    // sent (kill -SEGV, si_code <= 0) carries the sender's pid and uid there instead.
+    const bool sentByProcess = info != nullptr && info->si_code <= 0;
+    void* faultAddress = info != nullptr && !sentByProcess ? info->si_addr : nullptr;
+    if (sentByProcess) {
+        RT_LOGF(RT_TAG_RUNTIME, "Signal %d was sent by a process (pid %d), not raised by the CPU\n", sig,
+                static_cast<int>(info->si_pid));
+    }
     bool isWrite = false;
 #if defined(__x86_64__)
     // Standard glibc technique for a POSIX fastmem-style handler: bit 1 (0x2) of the hardware
@@ -1192,14 +1301,17 @@ void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
     }
 #endif
 
+    // SIGILL and SIGFPE come here only to be reported: si_addr is then the instruction, not a data address.
+    const bool memoryFault = sig == SIGSEGV || sig == SIGBUS;
+
     // Guest-space faults are the flat memory interception mechanism (MMIO, deferred EFB reads,
     // the executable-write guard, unmapped pages). Resolving one here means resuming the
     // faulting instruction, which just returning from the handler does.
-    if (faultAddress != nullptr && GuestFlat::HandleAccessViolation(faultAddress, isWrite)) {
+    if (memoryFault && faultAddress != nullptr && GuestFlat::HandleAccessViolation(faultAddress, isWrite)) {
         return;
     }
 
-    if (g_suppressSehReporting && g_sehJumpTarget) {
+    if (memoryFault && g_suppressSehReporting && g_sehJumpTarget) {
         g_sehLastExceptionCode = static_cast<uint32_t>(sig);
         g_sehLastExceptionAddress = reinterpret_cast<uintptr_t>(faultAddress);
         g_sehLastAccessType = isWrite ? 1u : 0u;
@@ -1219,8 +1331,19 @@ void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
     if (s_inCrashHandler.test_and_set()) {
         std::_Exit(EXIT_FAILURE);
     }
+    // The report below allocates and takes locks the crashed thread may hold. If it deadlocks, SIGALRM's default
+    // action ends the process, so a crash never turns into a hang (the logs written so far stay).
+    alarm(20);
 
     ReportUnhandledSignalFault(sig, faultAddress);
+    // Logs first, the popup last: the player may leave the popup open or kill the game from it.
+    DumpHostStackTrace();
+    const char* fatalName = sig == SIGBUS ? "sigbus" : sig == SIGILL ? "sigill" : sig == SIGFPE ? "sigfpe" : "sigsegv";
+    WriteFatalLogImpl(fatalName);
+    std::cerr.flush();
+    std::fflush(stderr);
+    alarm(0);
+
     std::ostringstream popupDetails;
     popupDetails << "A native signal (" << sig << ") occurred";
     if (!g_lastEntryLabel.empty()) {
@@ -1234,8 +1357,6 @@ void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
     popupDetails << ".\n\nThe process transcript and crash log contain the full CPU and stack "
                     "diagnostics.";
     ShowRuntimeFatalPopup("a native crash occurred", popupDetails.str());
-    DumpHostStackTrace();
-    WriteFatalLogImpl(sig == SIGBUS ? "sigbus" : "sigsegv");
 
     std::cerr.flush();
     std::cout.flush();
@@ -1254,6 +1375,15 @@ void InstallPosixMemoryFaultHandler() {
     // SIGSEGV on Linux; region sizing should make this unreachable, but routing it to the same
     // handler costs nothing and avoids a silent gap if it ever isn't.
     sigaction(SIGBUS, &action, nullptr);
+    // An illegal instruction (a CPU without an instruction the build uses) or an integer divide by zero: report it
+    // like a memory fault instead of dying with no log line.
+    sigaction(SIGILL, &action, nullptr);
+    sigaction(SIGFPE, &action, nullptr);
+#if defined(RECOMP_HAS_POSIX_BACKTRACE)
+    // The first backtrace() loads the unwinder (libgcc_s), which allocates: do it now rather than inside a crash.
+    void* warmup[2];
+    ::backtrace(warmup, 2);
+#endif
 }
 #endif
 
@@ -1375,6 +1505,7 @@ int RuntimeMain(int argc, char** argv) {
     InstallPosixMemoryFaultHandler();
 #endif
     InitializeProcessTranscript(argc, argv);
+    SystemReport::LogHostSystem();
     std::signal(SIGABRT, AbortSignalHandler);
     // Install exit/terminate handlers to ensure we get crash info
     std::atexit(AtExitHandler);
@@ -1389,45 +1520,55 @@ int RuntimeMain(int argc, char** argv) {
         RuntimeConfigFile::LogLoadedConfig();
         // The player's own extracted game (game_folder.h); on Windows it is asked for at first start.
         if (!GameFolder::EnsureConfigured()) {
+#if defined(_WIN32)
+            // The player was asked for the folder and gave up.
             SetRuntimeExitCodeImpl(0);
-            ShutdownProcessTranscript();
+            ShutdownProcessTranscript("quit (no game folder chosen)");
             return 0;
+#else
+            // Already explained (a message box, or RecompLauncher's message for the code): not a crash, so no fatal
+            // popup or crash file from the exit handler.
+            g_fatalErrorReported.store(true, std::memory_order_release);
+            SetRuntimeExitCodeImpl(GameFolder::kNoGameExitCode);
+            ShutdownProcessTranscript("stopped: no game folder (exit code 3)");
+            return GameFolder::kNoGameExitCode;
+#endif
         }
 #if defined(__ANDROID__)
-        // Determinism testing on a phone: debug.nsmbw.det=1 turns the lockstep timing on,
-        // debug.nsmbw.dethash / detdump set NSMBW_DET_HASH / NSMBW_DET_DUMP (det_hash.h) and
-        // debug.nsmbw.script[2|3] the scripted remote (NSMBW_INPUT_SCRIPT), 91 characters each.
+        // Determinism testing on a phone: debug.no100f.det=1 turns the lockstep timing on,
+        // debug.no100f.dethash / detdump set NO100F_DET_HASH / NO100F_DET_DUMP (det_hash.h) and
+        // debug.no100f.script[2|3] the scripted remote (NO100F_INPUT_SCRIPT), 91 characters each.
         {
             const auto property = [](const char* name) {
                 char value[PROP_VALUE_MAX] = {};
                 return __system_property_get(name, value) > 0 ? std::string(value) : std::string();
             };
-            if (property("debug.nsmbw.det") == "1") {
-                setenv("NSMBW_DETERMINISTIC", "1", 1);
+            if (property("debug.no100f.det") == "1") {
+                setenv("NO100F_DETERMINISTIC", "1", 1);
             }
-            for (const auto& [prop, env] : {std::pair{"debug.nsmbw.dethash", "NSMBW_DET_HASH"},
-                                            std::pair{"debug.nsmbw.detdump", "NSMBW_DET_DUMP"},
-                                            std::pair{"debug.nsmbw.lobbytest", "NSMBW_LOBBY_TEST"},
-                                            std::pair{"debug.nsmbw.tsonly", "NSMBW_NET_TAILSCALE_ONLY"},
-                                            std::pair{"debug.nsmbw.tapscript", "NSMBW_TAP_SCRIPT"},
-                                            std::pair{"debug.nsmbw.warp", "NSMBW_WARP"},
-                                            std::pair{"debug.nsmbw.logfps", "NSMBW_LOG_FPS"},
-                                            std::pair{"debug.nsmbw.patchreadback", "NSMBW_PATCH_READBACK"}}) {
+            for (const auto& [prop, env] : {std::pair{"debug.no100f.dethash", "NO100F_DET_HASH"},
+                                            std::pair{"debug.no100f.detdump", "NO100F_DET_DUMP"},
+                                            std::pair{"debug.no100f.lobbytest", "NO100F_LOBBY_TEST"},
+                                            std::pair{"debug.no100f.tsonly", "NO100F_NET_TAILSCALE_ONLY"},
+                                            std::pair{"debug.no100f.tapscript", "NO100F_TAP_SCRIPT"},
+                                            std::pair{"debug.no100f.warp", "NO100F_WARP"},
+                                            std::pair{"debug.no100f.logfps", "NO100F_LOG_FPS"},
+                                            std::pair{"debug.no100f.patchreadback", "NO100F_PATCH_READBACK"}}) {
                 if (const std::string value = property(prop); !value.empty()) {
                     setenv(env, value.c_str(), 1);
                 }
             }
-            std::string script = property("debug.nsmbw.script") + property("debug.nsmbw.script2") +
-                                 property("debug.nsmbw.script3");
+            std::string script = property("debug.no100f.script") + property("debug.no100f.script2") +
+                                 property("debug.no100f.script3");
             if (!script.empty()) {
-                setenv("NSMBW_INPUT_SCRIPT", script.c_str(), 1);
+                setenv("NO100F_INPUT_SCRIPT", script.c_str(), 1);
             }
-            if (const std::string session = property("debug.nsmbw.sscript"); !session.empty()) {
-                setenv("NSMBW_SESSION_SCRIPT", session.c_str(), 1);
+            if (const std::string session = property("debug.no100f.sscript"); !session.empty()) {
+                setenv("NO100F_SESSION_SCRIPT", session.c_str(), 1);
             }
         }
 #endif
-        if (const char* deterministic = std::getenv("NSMBW_DETERMINISTIC");
+        if (const char* deterministic = std::getenv("NO100F_DETERMINISTIC");
             deterministic != nullptr && std::string(deterministic) == "1") {
             DetClock::Enable();
         }
@@ -1447,7 +1588,7 @@ int RuntimeMain(int argc, char** argv) {
             }
             NetplaySession::SetStallHandler(&NetplayUi::OnSessionStall);
         }
-        if (RuntimeConfigFile::DiscordPresenceEnabled()) {
+        if (RuntimeConfigFile::DiscordPresenceEnabled() && !RuntimeConfigFile::DiscordClientId().empty()) {
             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Scooby-Doo: Re-Masked");
         }
         SystemBridge::Initialize();
@@ -1458,6 +1599,10 @@ int RuntimeMain(int argc, char** argv) {
         // This is required for GX commands (like texture loading) to work.
         AuroraConfig auroraConfig = {};
         auroraConfig.appName = RuntimeProduct::Active().displayName.data();
+        // The in-game menus' fonts and colours (F10 settings, F8 dev menu).
+        auroraConfig.imGuiInitCallback = &OverlayTheme::Initialize;
+        RT_LOG(RT_TAG_RUNTIME) << "FrightWorks build " << BuildInfo::Id()
+                               << (RuntimeConfigFile::DevTools() ? " (dev tools on)" : "") << std::endl;
         const auto applicationDataDirectory = RuntimeConfigFile::ApplicationDataDirectory();
         const auto rendererCacheDirectory = applicationDataDirectory / "Cache";
         std::error_code rendererPathError;
@@ -1471,7 +1616,7 @@ int RuntimeMain(int argc, char** argv) {
         const std::string auroraCachePath = RuntimeConfigFile::PathToUtf8(rendererCacheDirectory);
         auroraConfig.userPath = auroraUserPath.c_str();
         auroraConfig.cachePath = auroraCachePath.c_str();
-        // initial_pipeline_cache.db (NSMBW's pipelines, merged into the user's cache at startup)
+        // initial_pipeline_cache.db (prebuilt pipelines, merged into the user's cache at startup)
         // sits beside the executable, or in the app's unpacked runtime folder on Android.
         const auto runtimeDirectory = RuntimeConfigFile::ExecutableDirectory();
         const std::string auroraResourcesPath =
@@ -1481,7 +1626,7 @@ int RuntimeMain(int argc, char** argv) {
         }
         auroraConfig.logCallback = &RuntimeAuroraLogCallback;
         auroraConfig.logLevel = LOG_DEBUG;
-        // NSMBW display settings: aspect_mode, else the older widescreen/force_16_9 keys.
+        // Display settings: aspect_mode, else the older widescreen/force_16_9 keys.
         DisplaySettings::Settings displaySettings;
         displaySettings.aspect = RuntimeConfigFile::AspectMode(
             RuntimeConfigFile::ForceAspect169Enabled()      ? DisplaySettings::kAspect16x9
@@ -1497,15 +1642,36 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.msaa = RuntimeConfigFile::Msaa(1);
         auroraConfig.hasWindowPosition = RuntimeConfigFile::WindowPosition(
             auroraConfig.windowPosX, auroraConfig.windowPosY);
-        auroraConfig.allowJoystickBackgroundEvents = true;
+        // Controllers keep working while another window is in front (#123), except under RecompLauncher: its overlay
+        // and its own controller menus use the pad while the game runs, so there the game listens only with focus.
+        auroraConfig.allowJoystickBackgroundEvents = !RuntimeConfigFile::StartedByRecompLauncher();
         auroraConfig.disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
+        auroraConfig.msaa = RuntimeConfigFile::Msaa(1);
+        auroraConfig.motionBlur = RuntimeConfigFile::MotionBlurShutter(RuntimeConfigFile::MotionBlur());
+        auroraConfig.ambientOcclusion = static_cast<float>(std::clamp(RuntimeConfigFile::AmbientOcclusion(), 0, 100)) / 100.0f;
+        auroraConfig.inkOutlines = std::clamp(RuntimeConfigFile::InkOutlines(), 0, 2);
+        auroraConfig.bloom = static_cast<float>(std::clamp(RuntimeConfigFile::Bloom(), 0, 100)) / 100.0f;
         // Dolphin-style custom textures. Aurora indexes <userPath>/texture_replacements
         // once during aurora_initialize, so both knobs only take effect on the next launch.
         // Dumps name each unmatched texture the way its replacement would have to be named,
         // which is only useful while the index is live - hence the conjunction.
-        auroraConfig.allowTextureReplacements = RuntimeConfigFile::TextureReplacements(true);
-        auroraConfig.allowTextureDumps = auroraConfig.allowTextureReplacements &&
-                                         RuntimeConfigFile::TextureDumps(false);
+        // The player's Xbox textures (<UserData>/xbox/textures, written by the launcher from their own Xbox disc:
+        // launcher/XboxTextures.cs) are the GameCube's textures without its lossy formats. They come after every other
+        // folder, so the HD pack wins where it has a texture; with the HD pack off they are the only replacements.
+        const bool hdTextures = RuntimeConfigFile::TextureReplacements(true);
+        std::error_code xboxError;
+        const auto xboxTextures = applicationDataDirectory / "xbox" / "textures";
+        const bool haveXboxTextures = std::filesystem::is_directory(xboxTextures, xboxError);
+        const std::string auroraXboxTexturesPath = haveXboxTextures ? RuntimeConfigFile::PathToUtf8(xboxTextures) : std::string();
+        auroraConfig.allowTextureReplacements = hdTextures || haveXboxTextures;
+        auroraConfig.allowTextureDumps = hdTextures && RuntimeConfigFile::TextureDumps(false);
+        auroraConfig.extraTexturePath = haveXboxTextures ? auroraXboxTexturesPath.c_str() : nullptr;
+        auroraConfig.extraTexturesOnly = !hdTextures;
+        // The game's font sheets redrawn sharp as they load, HD textures on or off ([video] sharp_font).
+        auroraConfig.sharpFont = RuntimeConfigFile::SharpFont(true);
+        // The flat pause menu and map icons redrawn sharp where nothing replaces them ([video] sharp_icons).
+        auroraConfig.sharpIcons = RuntimeConfigFile::SharpIcons(true);
+        aurora_set_cutout_mode(RuntimeConfigFile::CutoutMode());
         // No vsync knob: aurora always configures a non-blocking present mode.
         auroraConfig.desiredBackend = BACKEND_AUTO;
         // GPU driver workarounds: picked from the graphics adapter unless the player forced them.
@@ -1556,12 +1722,12 @@ int RuntimeMain(int argc, char** argv) {
         // visible on that first scan.
         WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
 #if defined(__ANDROID__)
-        // Graphics debugging on a phone without a rebuild: `adb shell setprop debug.nsmbw.gfx
+        // Graphics debugging on a phone without a rebuild: `adb shell setprop debug.no100f.gfx
         // validate,robust` reaches aurora's device setup as AURORA_GFX_FLAGS (webgpu/gpu.cpp).
-        // A property holds 91 characters, so debug.nsmbw.gfx2 and gfx3 continue the list.
+        // A property holds 91 characters, so debug.no100f.gfx2 and gfx3 continue the list.
         {
             std::string flags;
-            for (const char* name : {"debug.nsmbw.gfx", "debug.nsmbw.gfx2", "debug.nsmbw.gfx3"}) {
+            for (const char* name : {"debug.no100f.gfx", "debug.no100f.gfx2", "debug.no100f.gfx3"}) {
                 char value[PROP_VALUE_MAX] = {};
                 if (__system_property_get(name, value) > 0) {
                     flags += flags.empty() ? "" : ",";
@@ -1570,13 +1736,19 @@ int RuntimeMain(int argc, char** argv) {
             }
             if (!flags.empty()) {
                 setenv("AURORA_GFX_FLAGS", flags.c_str(), 1);
-                RT_LOG(RT_TAG_RUNTIME) << "debug.nsmbw.gfx flags: " << flags << std::endl;
+                RT_LOG(RT_TAG_RUNTIME) << "debug.no100f.gfx flags: " << flags << std::endl;
             }
         }
 #endif
 
 
         aurora_set_hdr(RuntimeConfigFile::Hdr(), RuntimeConfigFile::HdrPaperWhiteNits(), RuntimeConfigFile::HdrPeakNits());
+        // Known before the window exists when starting fullscreen, so it opens on the chosen monitor. A game starting
+        // in a window opens at its own spot and gets the choice in InitializeRuntimeSettings.
+        if (RuntimeConfigFile::StartDisplayMode() != "windowed") {
+            aurora_set_fullscreen_monitor(RuntimeConfigFile::FullscreenDisplay().c_str());
+        }
+        no100f_light_textures::Apply();  // before the first textures are drawn
         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
         if (auroraInfo.initializationStatus != AURORA_INITIALIZATION_SUCCESS) {
             throw std::runtime_error(auroraInfo.initializationError != nullptr
@@ -1594,6 +1766,7 @@ int RuntimeMain(int argc, char** argv) {
         GraphicsInfo::Set(auroraInfo.gpuName != nullptr ? auroraInfo.gpuName : "", auroraInfo.gpuCompatActive);
         RT_LOG(RT_TAG_RUNTIME) << "graphics adapter: " << GraphicsInfo::Name() << ", compatibility fixes "
                   << (auroraInfo.gpuCompatActive ? "on" : "off") << std::endl;
+        SystemReport::LogVideoDriver();
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);
         GxGuestWrite::InstallAuroraHooks();
         DisplaySettings::OnFrameBoundary(auroraInfo.windowSize.native_fb_width,
@@ -1640,12 +1813,26 @@ int RuntimeMain(int argc, char** argv) {
         // Shutdown fiber system
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        if (aurora::window_owner::enabled()) AudioBackend::Instance().Shutdown();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         SetRuntimeExitCodeImpl(0);
-        ShutdownProcessTranscript();
+        ShutdownProcessTranscript("quit (the game loop returned)");
+        return 0;
+    } catch (const aurora::window_owner::CloseRequested&) {
+        aurora::window_owner::begin_shutdown();
+        no100f_recorder::FinishForExit();
+        Fiber::GuestFiberManager::Shutdown();
+        settings_overlay::ReleaseControllers();
+        WindowPlacementPersistence::Flush(true);
+        AudioBackend::Instance().Shutdown();
+        aurora_shutdown();
+        DiscordPresence::Shutdown();
+        SetRuntimeExitCodeImpl(0);
+        ShutdownProcessTranscript("quit (window closed)");
         return 0;
     } catch (const Memory::AccessViolation& ex) {
+        if (aurora::window_owner::enabled()) aurora::window_owner::begin_shutdown();
         std::cerr << "Runtime error: " << ex.what() << std::endl;
         DumpAccessViolationReport(ex, currentEntryLabel);
         std::ostringstream details;
@@ -1658,11 +1845,13 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        if (aurora::window_owner::enabled()) AudioBackend::Instance().Shutdown();
         aurora_shutdown();
         DiscordPresence::Shutdown();
-        ShutdownProcessTranscript();
+        ShutdownProcessTranscript("stopped by a guest memory error (exit code 1)");
         return 1;
     } catch (const std::exception& ex) {
+        if (aurora::window_owner::enabled()) aurora::window_owner::begin_shutdown();
         std::cerr << "Runtime error: " << ex.what() << std::endl;
         SystemBridge::DumpCpuState(TryGetCpuContext());
         ShowRuntimeFatalPopup("a runtime exception occurred", ex.what());
@@ -1670,9 +1859,10 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        if (aurora::window_owner::enabled()) AudioBackend::Instance().Shutdown();
         aurora_shutdown();
         DiscordPresence::Shutdown();
-        ShutdownProcessTranscript();
+        ShutdownProcessTranscript("stopped by a runtime error (exit code 1)");
         return 1;
     }
 }
@@ -1684,6 +1874,17 @@ extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** 
 }
 #else
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    try {
+        return aurora::window_owner::run([=] { return RuntimeMain(argc, argv); });
+    } catch (const std::exception& error) {
+        std::cerr << "[runtime] window owner failed: " << error.what() << '\n';
+        ShowRuntimeFatalPopup("the window owner failed", error.what());
+        WriteFatalLogImpl("window_owner", error.what());
+        SetRuntimeExitCodeImpl(1);
+        return 1;
+    }
+#endif
     return RuntimeMain(argc, argv);
 }
 #endif

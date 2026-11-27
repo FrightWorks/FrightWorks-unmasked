@@ -95,6 +95,9 @@ const char* AccelCalibrationMessage();
 // KPAD, so the game never sees the same remote twice. Runs after aurora's PADRead.
 void HideRemotesFromPad(PADStatus* statuses, uint32_t count);
 
+// Buttons NO100F_INPUT_SCRIPT holds for GameCube pad 1 now; false without a script.
+bool ScriptedPadButtons(uint16_t& buttons);
+
 // Dolphin-style continuous scanning. SDL's HIDAPI Wii driver drops a remote on
 // a failed Bluetooth read or an extension change and never re-adds it on its
 // own. Poll() runs once per PADRead and, while no Wii controller is present,

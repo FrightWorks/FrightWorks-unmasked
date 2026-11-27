@@ -133,7 +133,7 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
             }
             SDL_free(ids);
         }
-        aurora_set_button_icon_style(style);
+        aurora_set_button_icons(style, nullptr);  // the GameCube A, B, X, Y icons of that family
     }
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);

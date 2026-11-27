@@ -15,7 +15,6 @@
 #include "platform/host_platform.h"
 #include "runtime_log.h"
 #include "guest_profiler.h"
-#include "spm_map_sweep.h"
 
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
@@ -398,7 +397,8 @@ static std::atomic<bool> s_presentSequenceActive{false};
 // watchdog that dumps every guest thread's state if none arrived after 12 s and again after 30 s, so
 // a boot that stalls in a wait loop shows where each thread is parked.
 static std::atomic<uint32_t> s_presentedXfbFrames{0};
-extern "C" { extern int g_spmDrawDump; extern int g_spmCullOff; extern int g_spmSweepDump; extern unsigned g_spmDrawIdx; extern unsigned g_spmDrawLimit; }  // aurora command_processor (SPM bring-up diagnostics)
+extern "C" { extern int g_gxDrawDump; extern int g_gxCullOff; extern unsigned g_gxDrawIdx; extern unsigned g_gxDrawLimit; }
+extern "C" { int g_spmSweepDump = 0; }  // was set by the SPM map sweep (removed); gx_dl.cpp and gx_lighting.cpp still read it  // aurora command_processor (SPM bring-up diagnostics)
 static uint32_t SpmPresentedFramesLocal() { return s_presentedXfbFrames.load(std::memory_order_relaxed); }
 static uint32_t (*const g_spmFramesFn)() = &SpmPresentedFramesLocal;
 
@@ -527,7 +527,6 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     StartStallWatchdogOnce();
     LogGuestModulesOnce();
     LogSceneChanges();
-    SpmMapSweep::Tick(ctx, s_presentedXfbFrames.load(std::memory_order_relaxed));
 
     uint32_t preCb = 0;
     uint32_t postCb = 0;
@@ -578,7 +577,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     // Deterministic mode: this retrace starts a frame. Fingerprint guest memory as the previous
     // frame left it, then latch every channel's input for the new one before any guest code reads it.
     if (DetClock::Enabled()) {
-        DetHash::OnRetrace(retraceValue);
+        DetHash::OnRetrace(retraceValue, ctx ? ctx->gpr[1] : 0);
         FrameInput::Latch(retraceValue);
     }
 
@@ -641,11 +640,11 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
         const bool shouldSubmit = frameActive && (shouldPresentXfb || shouldPresentBlack);
 
         if (shouldSubmit) {
-            if (!isBlack || settings_overlay::StartupScreenVisible()) {
+            if (!isBlack) {
                 // Normal presentation: draw overlay on top of GX content
                 settings_overlay::Draw();
             }
-            // Outside startup, VI black remains a pure black presentation.
+            // VI black remains a pure black presentation.
             // Unpaced: this present already runs in retrace context.
             VI_HLE_PresentFrame(shouldPresentXfb, false);
         } else if (g_auroraFrameHadWork.load(std::memory_order_acquire) && !shouldPresentXfb && !isBlack) {
@@ -866,12 +865,12 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             const uint32_t pf = s_presentedXfbFrames.fetch_add(1, std::memory_order_relaxed) + 1;
             static const int32_t dumpTarget = [] { std::ifstream in("drawdump.txt"); int32_t f = -1; in >> f; return f; }();
             static const bool cullTest = std::ifstream("depth_test.txt").good();
-            g_spmDrawDump = ((dumpTarget >= 0 && pf == static_cast<uint32_t>(dumpTarget)) || g_spmSweepDump) ? 1 : 0;
+            g_gxDrawDump = ((dumpTarget >= 0 && pf == static_cast<uint32_t>(dumpTarget)) || g_spmSweepDump) ? 1 : 0;
             static const int envTest = [] { const char* e = std::getenv("SPM_CULL_TEST"); return e ? std::atoi(e) : 0; }();  // 1 = no culling, 2 = no depth test (diagnostic)
             static const unsigned drawLimit = [] { const char* e = std::getenv("SPM_DRAW_LIMIT"); return e ? static_cast<unsigned>(std::atoi(e)) : ~0u; }();
-            g_spmDrawLimit = drawLimit;
-            g_spmDrawIdx = 0;
-            g_spmCullOff = envTest ? envTest : ((cullTest && pf >= 6900u) ? 2 : 0);
+            g_gxDrawLimit = drawLimit;
+            g_gxDrawIdx = 0;
+            g_gxCullOff = envTest ? envTest : ((cullTest && pf >= 6900u) ? 2 : 0);
         }
         // SPM bring-up: with drawdump.txt present, report any guest write into the DOL's
         // read-only sections (.rodata/.sdata2) once the game has been running a while.
@@ -1053,7 +1052,6 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             times.lastPresentEnd = now;
         }
     }
-    settings_overlay::AdvancePresentedFrame();
     g_auroraFrameActive.store(false, std::memory_order_release);
     g_auroraFrameHadWork.store(false, std::memory_order_release);
     if (presentedXfb) {

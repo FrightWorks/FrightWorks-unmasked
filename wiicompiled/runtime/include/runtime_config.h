@@ -35,6 +35,10 @@ struct RuntimeUserConfig {
     std::optional<bool> widescreen;
     std::optional<bool> forceAspect169;
     std::optional<int32_t> aspectMode;  // 0 original 4:3, 1 16:9, 2 fill the window (DisplaySettings)
+    std::optional<int32_t> motionBlur;  // [video] motion_blur: strength in percent, 0 = off (MotionBlurShutter)
+    std::optional<int32_t> ambientOcclusion;  // [video] ambient_occlusion: strength in percent, 0 = off
+    std::optional<int32_t> inkOutlines;  // [video] ink_outlines: 0 off, 1 thin, 2 bold
+    std::optional<int32_t> bloom;  // [video] bloom: strength in percent, 0 = off
     std::optional<int32_t> gpuCompat;  // 0 auto (by graphics adapter), 1 on, 2 off (AuroraGpuCompat)
     std::optional<int32_t> windowPosX;
     std::optional<int32_t> windowPosY;
@@ -43,22 +47,30 @@ struct RuntimeUserConfig {
     std::optional<float> resolutionMultiplier;
     std::optional<std::string> graphicsApi;
     std::optional<std::string> displayMode;
+    std::optional<std::string> fullscreenDisplay;  // "auto" or an AuroraMonitor id
     std::optional<uint32_t> frameInterpolationFps;
     std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
     std::optional<bool> disableCopyFilter;
     std::optional<bool> textureReplacements;
+    std::optional<int> cutoutMode;  // [video] cutout_mode, see CutoutMode()
     std::optional<bool> textureDumps;
+    std::optional<bool> sharpFont;  // [video] sharp_font, see SharpFont()
+    std::optional<bool> sharpIcons;  // [video] sharp_icons, see SharpIcons()
     std::optional<bool> showFps;
     std::optional<bool> skipIntro;
+    std::optional<bool> fps60;
+    std::optional<std::string> holiday;  // NO100F [game] holiday: "auto" (today), "off", "confetti" or "MM-DD"
+    std::optional<bool> devTools;        // NO100F [game] dev_tools: F8 dev menu + DEV build mark (launcher Extras)
+    std::optional<bool> recordAudio;     // NO100F [game] record_audio: F3 videos (dev tools) include the game's sound
+    std::optional<bool> captureOverlay;  // NO100F [game] capture_overlay: F2/F3 captures show the F8/F10 menus (dev tools)
     std::optional<uint32_t> msaa;
-    std::optional<bool> spinningCoins;  // NSMBW: [video] spinning_coins, animated tiles
-    std::optional<bool> frameGraph;     // NSMBW: [video] frame_graph, frame times under the FPS counter
+    std::optional<bool> spinningCoins;  // [video] spinning_coins, animated tiles
+    std::optional<bool> frameGraph;     // [video] frame_graph, frame times under the FPS counter
     std::optional<bool> hdr;             // [video] hdr: scRGB HDR output (startup only)
     std::optional<float> hdrPaperWhiteNits;
     std::optional<float> hdrPeakNits;
-    std::optional<bool> vsync;          // NSMBW: [video] vsync, presents wait for the display (Windows)
-    std::optional<uint32_t> disabledPostProcessingPaths;
+    std::optional<bool> vsync;          // [video] vsync, presents wait for the display (Windows)
     std::optional<float> audioVolume;
     std::optional<float> audioMusicVolume;
     std::optional<float> audioSoundEffectsVolume;
@@ -89,23 +101,30 @@ struct RuntimeUserConfig {
     std::optional<bool> networkEnabled;
     std::optional<bool> discordPresenceEnabled;
     // The application ID of the WiiCompiled Discord application. This is only
-    // used by the base product; Retro Rewind supplies its own ID through the
+    // used by the base product; a mod supplies its own ID through the
     // standard Dolphin /dev/dolphin interface.
     std::optional<std::string> discordClientId;
     std::optional<std::string> nandRoot;
     std::optional<std::string> dvdRoot;
-    // The one canonical Retro Rewind installation, owned and updated by the frontend. Setup records
+    // [paths] saves_dir: where the saves go instead of the default (SavesDirectory).
+    std::optional<std::string> savesDir;
+    // The one canonical mod installation, owned and updated by the frontend. Setup records
     // it here instead of copying the pack, so an asset-only update is visible on the next launch.
-    std::optional<std::string> retroRewindRoot;
+    std::optional<std::string> modInstallRoot;
     std::vector<std::string> overlayRoots;
     // Controller mappings use Wii/GameCube button names as keys and up to two
     // comma-separated SDL-style physical button names ("south", or
     // "dpad_up,left_shoulder") as values; pressing either bound button counts.
     std::array<std::optional<std::string>, 12> controllerButtons;
     std::optional<bool> rumbleEnabled;
+    // [controller] layout: "gamecube" (default) or "xbox_original" (hle/no100f_xbox_layout.h).
+    std::optional<std::string> controllerLayout;
+    // [controller] xbox_black / xbox_white: the pad button for Xbox Black (sneak) / White (soap bubble) with the
+    // original Xbox layout, as a controller_button_names.h name ("right_shoulder", "north", "disabled", ...).
+    std::array<std::optional<std::string>, 2> xboxButtons;
     std::optional<int32_t> muteHotkey;
     std::map<std::string, std::string> controllerExpressions;
-    // NSMBW: [keyboard] action = "comma-separated SDL scancode names" (keybinds.h).
+    // [keyboard] action = "comma-separated SDL scancode names" (keybinds.h).
     std::map<std::string, std::string> keyboardBindings;
     std::map<std::string, std::string> gamepadBindings;  // [gamepad]: type + per-action overrides
 };
@@ -199,6 +218,17 @@ inline bool IsSupportedDisplayMode(std::string_view value) {
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
+// NO100F [game] holiday: "auto", "off", "confetti" (multicoloured fireworks), or a forced date "MM-DD".
+inline bool IsSupportedHoliday(std::string_view value) {
+    if (value == "auto" || value == "off" || value == "confetti") return true;
+    if (value.size() != 5 || value[2] != '-') return false;
+    for (const size_t i : {size_t{0}, size_t{1}, size_t{3}, size_t{4}})
+        if (value[i] < '0' || value[i] > '9') return false;
+    const int month = (value[0] - '0') * 10 + (value[1] - '0');
+    const int day = (value[3] - '0') * 10 + (value[4] - '0');
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
 // 240 was offered by an early build and is no longer supported; a saved 240 is
 // migrated to 180 at the parse site.
 inline bool IsSupportedFrameInterpolationFps(uint32_t value) {
@@ -241,15 +271,6 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
 #endif
 }
 
-// NSMBW: the Windows downloads up to 0.0.7 shipped this marker; such a folder is an old release,
-// whose UserData moves to Documents\MarioWiiSaveData (AdoptEarlierUserData), not a portable root.
-inline bool IsReleasedNsmbwMarker(const std::filesystem::path& marker) {
-    std::ifstream input(marker);
-    std::string line;
-    std::getline(input, line);
-    return line.rfind("Keep this file: settings, saves and caches stay in the UserData", 0) == 0;
-}
-
 // The portable root this executable lives under, or nullopt for a normal installation. The answer
 // cannot change while the process runs, so it is resolved exactly once: every user-state path
 // derives from it and they must not disagree with each other.
@@ -262,8 +283,7 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
         std::filesystem::path current = *executableDirectory;
         for (int level = 0; level <= kPortableSearchDepth; ++level) {
             std::error_code ec;
-            if (std::filesystem::is_regular_file(current / kPortableMarkerFileName, ec) &&
-                !IsReleasedNsmbwMarker(current / kPortableMarkerFileName)) {
+            if (std::filesystem::is_regular_file(current / kPortableMarkerFileName, ec)) {
                 return current;
             }
             const auto parent = current.parent_path();
@@ -278,57 +298,22 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
 }
 
 #ifdef _WIN32
-// NSMBW: on Windows the settings (with the game folder), saves and caches live in
-// Documents\MarioWiiSaveData, so a new version extracted anywhere carries on where the last left off.
-inline constexpr const wchar_t* kDocumentsDataDirectoryName = L"MarioWiiSaveData";
+// FrightWorks without the portable marker is the installed game (Velopack, in %LOCALAPPDATA%\FrightWorks, which an
+// update replaces and an uninstall deletes, so nothing of the player's may live there): settings, logs, caches, the
+// extracted disc and mods go to %LOCALAPPDATA%\FrightWorks-Data, saves to Saved Games\FrightWorks (SavesDirectory),
+// F2 / F3 to Pictures\FrightWorks and Videos\FrightWorks (CaptureDirectory). launcher/DataPaths.cs uses the same
+// folders.
+inline constexpr const wchar_t* kInstalledDataDirectoryName = L"FrightWorks-Data";
+inline constexpr const wchar_t* kInstalledUserFolderName = L"FrightWorks";
 
-// The first start with an empty MarioWiiSaveData takes over the newest earlier data: a portable
-// UserData beside this executable or beside another version's NSMBW.exe in the folder above it
-// (each release extracts to its own NSMBW-x.y.z-windows-x64 folder), or %LOCALAPPDATA%\WiiCompiled.
-// Logs stay behind.
-inline void AdoptEarlierUserData(const std::filesystem::path& target) {
-    std::error_code ec;
-    if (std::filesystem::exists(target / kConfigFileName, ec)) {
-        return;
+inline std::optional<std::filesystem::path> KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR raw = nullptr;
+    std::optional<std::filesystem::path> path;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_CREATE, nullptr, &raw)) && raw) {
+        path = std::filesystem::path(raw);
     }
-    std::vector<std::filesystem::path> candidates;
-    if (const auto executableDirectory = ExecutableDirectory()) {
-        candidates.push_back(*executableDirectory / kPortableUserDataDirectoryName);
-        const auto parent = executableDirectory->parent_path();
-        for (std::filesystem::directory_iterator it(parent, ec), end; !ec && it != end; it.increment(ec)) {
-            if (it->is_directory(ec) && it->path() != *executableDirectory) {
-                candidates.push_back(it->path() / kPortableUserDataDirectoryName);
-            }
-        }
-    }
-    PWSTR localPath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localPath)) && localPath) {
-        candidates.push_back(std::filesystem::path(localPath) / kApplicationDirectoryName);
-        CoTaskMemFree(localPath);
-    }
-    std::optional<std::filesystem::path> newest;
-    std::filesystem::file_time_type newestTime{};
-    for (const auto& candidate : candidates) {
-        std::error_code timeError;
-        const auto time = std::filesystem::last_write_time(candidate / kConfigFileName, timeError);
-        if (!timeError && (!newest || time > newestTime)) {
-            newest = candidate;
-            newestTime = time;
-        }
-    }
-    if (!newest) {
-        return;
-    }
-    std::filesystem::create_directories(target, ec);
-    for (std::filesystem::directory_iterator it(*newest, ec), end; !ec && it != end; it.increment(ec)) {
-        if (it->path().filename() == "Logs") {
-            continue;
-        }
-        std::error_code copyError;
-        std::filesystem::copy(it->path(), target / it->path().filename(),
-                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing,
-                              copyError);
-    }
+    CoTaskMemFree(raw);
+    return path;
 }
 #endif
 
@@ -337,25 +322,9 @@ inline std::filesystem::path ApplicationDataDirectory() {
         return *portableRoot / kPortableUserDataDirectoryName;
     }
 #ifdef _WIN32
-    static const std::optional<std::filesystem::path> documents = []() -> std::optional<std::filesystem::path> {
-        PWSTR documentsPath = nullptr;
-        if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_CREATE, nullptr, &documentsPath)) ||
-            documentsPath == nullptr) {
-            return std::nullopt;
-        }
-        const std::filesystem::path directory = std::filesystem::path(documentsPath) / kDocumentsDataDirectoryName;
-        CoTaskMemFree(documentsPath);
-        AdoptEarlierUserData(directory);
-        return directory;
-    }();
-    if (documents) {
-        return *documents;
-    }
-    PWSTR rawPath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &rawPath)) && rawPath) {
-        const std::filesystem::path directory = std::filesystem::path(rawPath) / kApplicationDirectoryName;
-        CoTaskMemFree(rawPath);
-        return directory;
+    static const std::optional<std::filesystem::path> localAppData = KnownFolder(FOLDERID_LocalAppData);
+    if (localAppData) {
+        return *localAppData / kInstalledDataDirectoryName;
     }
 #elif defined(__APPLE__) || defined(__ANDROID__)
     return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
@@ -400,6 +369,16 @@ inline void EnsureConfigFile() {
               "resolution_multiplier = 2.25\n"
               "# 0 (off), 120 or 180\n"
               "frame_interpolation_fps = 120\n"
+              "# motion blur strength in percent: 0 = off, 10 = extra low, 20 = low, 30 = medium, 40 = high, 50 = extra high\n"
+              "motion_blur = 0\n"
+              "# ambient occlusion (experimental: shade in creases, corners and under things) in percent: 0 = off, 35 = low,\n"
+              "# 65 = medium\n"
+              "ambient_occlusion = 0\n"
+              "# cartoon ink outlines: 0 = off, 1 = thin, 2 = bold\n"
+              "ink_outlines = 0\n"
+              "# bloom (experimental: a soft glow around lit windows, lamp light, fire and sparkles) in percent: 0 = off,\n"
+              "# 40 = low, 70 = medium, 100 = high\n"
+              "bloom = 0\n"
               "# 0 = original 4:3, 1 = 16:9, 2 = fill the screen, 3 = cinematic 2.39:1\n"
               "aspect_mode = 3\n"
               "display_mode = \"borderless\"\n"
@@ -414,7 +393,25 @@ inline void EnsureConfigFile() {
               "# unmatched texture to Cache/texture_dumps under the name a\n"
               "# replacement would need. Both are read once, at startup.\n"
               "texture_replacements = true\n"
-              "texture_dumps = false\n\n"
+              "texture_dumps = false\n"
+              "# Redraw the game's menu and caption lettering at a high resolution\n"
+              "# with clean edges, made from the game's own font as it loads.\n"
+              "# Works with texture_replacements on or off.\n"
+              "sharp_font = true\n"
+              "# Redraw the flat pause menu and map icons at a high resolution with\n"
+              "# clean outlines, where texture_replacements has no picture for them.\n"
+              "sharp_icons = true\n\n"
+              "[game]\n"
+              "# Holiday events in the hubs (fireworks, Halloween bats, ...): \"auto\" = by today's date,\n"
+              "# \"off\" = never, \"confetti\" = fireworks with the colours mixed through each burst,\n"
+              "# or \"MM-DD\" to pretend it is that day (e.g. \"10-31\").\n"
+              "holiday = \"auto\"\n"
+              "# Developer tools: the F8 dev menu (travel, spots, free camera, texture finder) and a DEV build mark.\n"
+              "dev_tools = false\n"
+              "# With the developer tools on, F3 records a video of the game (needs ffmpeg); this adds the game's sound.\n"
+              "record_audio = true\n"
+              "# With the developer tools on: F2 screenshots and F3 videos show the F8/F10 menus too (else only the DEV stamp).\n"
+              "capture_overlay = false\n\n"
               "[audio]\n"
               "volume = 1.0\n"
               "music_volume = 1.0\n"
@@ -431,8 +428,8 @@ inline void EnsureConfigFile() {
               "enabled = true\n\n"
               "[discord]\n"
               "# Rich Presence talks only to a locally-running Discord client.\n"
-              "# Retro Rewind supplies its official app ID automatically. Set this\n"
-              "# to WiiCompiled's Discord application ID for basic base-game presence.\n"
+              "# Off until client_id names a Discord application: FrightWorks has none\n"
+              "# of its own yet.\n"
               "enabled = true\n"
               "# client_id = \"123456789012345678\"\n\n"
               "[paths]\n"
@@ -514,6 +511,9 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     }
 
     config.rumbleEnabled = FindConfigValue<bool>(document, "controller", "rumble");
+    config.controllerLayout = FindConfigValue<std::string>(document, "controller", "layout");
+    config.xboxButtons[0] = FindConfigValue<std::string>(document, "controller", "xbox_black");
+    config.xboxButtons[1] = FindConfigValue<std::string>(document, "controller", "xbox_white");
     if (auto value = FindConfigInt(document, "audio", "mute_key")) {
         config.muteHotkey = *value;
     }
@@ -549,6 +549,18 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     if (auto value = FindConfigInt(document, "video", "aspect_mode"); value && *value >= 0 && *value <= 3) {
         config.aspectMode = *value;
     }
+    if (auto value = FindConfigInt(document, "video", "motion_blur"); value && *value >= 0 && *value <= 100) {
+        config.motionBlur = *value;
+    }
+    if (auto value = FindConfigInt(document, "video", "ambient_occlusion"); value && *value >= 0 && *value <= 100) {
+        config.ambientOcclusion = *value;
+    }
+    if (auto value = FindConfigInt(document, "video", "ink_outlines"); value && *value >= 0 && *value <= 2) {
+        config.inkOutlines = *value;
+    }
+    if (auto value = FindConfigInt(document, "video", "bloom"); value && *value >= 0 && *value <= 100) {
+        config.bloom = *value;
+    }
     if (auto value = FindConfigInt(document, "video", "gpu_compat"); value && *value >= 0 && *value <= 2) {
         config.gpuCompat = *value;
     }
@@ -576,6 +588,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
         value && IsSupportedDisplayMode(*value)) {
         config.displayMode = *value;
     }
+    config.fullscreenDisplay = FindConfigValue<std::string>(document, "video", "fullscreen_display");
     if (auto value = FindConfigUint(document, "video", "frame_interpolation_fps")) {
         const uint32_t migrated = *value == 240u ? 180u : *value;
         if (IsSupportedFrameInterpolationFps(migrated)) {
@@ -588,6 +601,15 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.disableCopyFilter = FindConfigValue<bool>(document, "video", "disable_copy_filter");
     config.showFps = FindConfigValue<bool>(document, "video", "show_fps");
     config.skipIntro = FindConfigValue<bool>(document, "video", "skip_intro");
+    config.fps60 = FindConfigValue<bool>(document, "video", "fps60");
+    if (auto value = FindConfigValue<bool>(document, "game", "dev_tools")) {
+        config.devTools = *value;
+    }
+    config.recordAudio = FindConfigValue<bool>(document, "game", "record_audio");
+    config.captureOverlay = FindConfigValue<bool>(document, "game", "capture_overlay");
+    if (auto value = FindConfigValue<std::string>(document, "game", "holiday"); value && IsSupportedHoliday(*value)) {
+        config.holiday = *value;
+    }
     if (auto value = FindConfigUint(document, "video", "msaa"); value && (*value == 1 || *value == 2 || *value == 4 || *value == 8)) {
         config.msaa = *value;
     }
@@ -598,11 +620,14 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.hdrPaperWhiteNits = FindConfigFloat(document, "video", "hdr_paper_white_nits");
     config.hdrPeakNits = FindConfigFloat(document, "video", "hdr_peak_nits");
     config.textureReplacements = FindConfigValue<bool>(document, "video", "texture_replacements");
-    config.textureDumps = FindConfigValue<bool>(document, "video", "texture_dumps");
-    if (auto value = FindConfigUint(document, "video", "disabled_post_processing_paths");
-        value && (*value & ~0x10u) == 0) {
-        config.disabledPostProcessingPaths = *value & 0x10u;
+    if (auto value = FindConfigValue<std::string>(document, "video", "cutout_mode")) {
+        static constexpr std::string_view kModes[] = {"game", "cut", "twopass", "twopass_all"};
+        for (int i = 0; i < 4; ++i)
+            if (*value == kModes[i]) config.cutoutMode = i;
     }
+    config.textureDumps = FindConfigValue<bool>(document, "video", "texture_dumps");
+    config.sharpFont = FindConfigValue<bool>(document, "video", "sharp_font");
+    config.sharpIcons = FindConfigValue<bool>(document, "video", "sharp_icons");
 
     auto readVolume = [&](std::string_view key) -> std::optional<float> {
         auto value = FindConfigFloat(document, "audio", key);
@@ -629,7 +654,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
 
     config.nandRoot = FindConfigValue<std::string>(document, "paths", "nand_root");
     config.dvdRoot = FindConfigValue<std::string>(document, "paths", "dvd_root");
-    config.retroRewindRoot = FindConfigValue<std::string>(document, "paths", "retro_rewind_root");
+    config.savesDir = FindConfigValue<std::string>(document, "paths", "saves_dir");
+    config.modInstallRoot = FindConfigValue<std::string>(document, "paths", "retro_rewind_root");
     if (auto roots = FindConfigValue<std::vector<std::string>>(document, "paths", "overlay_roots")) {
         for (auto& root : *roots) {
             root = Trim(root);
@@ -817,6 +843,11 @@ inline bool SetDisplayMode(std::string value) {
     return WriteSetting("video", "display_mode", FormatString(value));
 }
 
+inline bool SetFullscreenDisplay(std::string value) {
+    Mutable().fullscreenDisplay = value;
+    return WriteSetting("video", "fullscreen_display", FormatString(value));
+}
+
 inline bool SetSkipUnreadyPipelines(bool value) {
     Mutable().skipUnreadyPipelines = value;
     return WriteSetting("video", "skip_unready_pipelines", value ? "true" : "false");
@@ -845,9 +876,35 @@ inline bool SetFrameGraph(bool value) {
     return WriteSetting("video", "frame_graph", value ? "true" : "false");
 }
 
-inline bool Hdr() { return Get().hdr.value_or(false); }
-inline float HdrPaperWhiteNits() { return std::clamp(Get().hdrPaperWhiteNits.value_or(200.f), 80.f, 1000.f); }
-inline float HdrPeakNits() { return std::clamp(Get().hdrPeakNits.value_or(1000.f), 80.f, 10000.f); }
+inline bool Hdr(const RuntimeUserConfig& config = Get()) { return config.hdr.value_or(false); }
+inline float HdrPaperWhiteNits(const RuntimeUserConfig& config = Get()) { return std::clamp(config.hdrPaperWhiteNits.value_or(200.f), 80.f, 1000.f); }
+inline float HdrPeakNits(const RuntimeUserConfig& config = Get()) { return std::clamp(config.hdrPeakNits.value_or(1000.f), 80.f, 10000.f); }
+
+inline bool SetHdr(bool value) {
+    if (!WriteSetting("video", "hdr", value ? "true" : "false")) return false;
+    Mutable().hdr = value;
+    return true;
+}
+
+inline bool SetHdrPaperWhiteNits(float value) {
+    if (!std::isfinite(value) || value < 80.f || value > 1000.f) {
+        std::cerr << "[runtime-config] Invalid HDR paper white: " << value << std::endl;
+        return false;
+    }
+    if (!WriteSetting("video", "hdr_paper_white_nits", std::to_string(value))) return false;
+    Mutable().hdrPaperWhiteNits = value;
+    return true;
+}
+
+inline bool SetHdrPeakNits(float value) {
+    if (!std::isfinite(value) || value < 80.f || value > 10000.f) {
+        std::cerr << "[runtime-config] Invalid HDR peak: " << value << std::endl;
+        return false;
+    }
+    if (!WriteSetting("video", "hdr_peak_nits", std::to_string(value))) return false;
+    Mutable().hdrPeakNits = value;
+    return true;
+}
 
 inline bool VSync(bool fallback = false) {
     return Get().vsync.value_or(fallback);
@@ -861,13 +918,6 @@ inline bool SetVSync(bool value) {
 inline bool SetShowFps(bool value) {
     Mutable().showFps = value;
     return WriteSetting("video", "show_fps", value ? "true" : "false");
-}
-
-inline bool SetDisabledPostProcessingPaths(uint32_t value) {
-    Mutable().disabledPostProcessingPaths = value;
-    std::ostringstream formatted;
-    formatted << "0x" << std::hex << std::uppercase << value;
-    return WriteSetting("video", "disabled_post_processing_paths", formatted.str());
 }
 
 inline bool SetControllerButton(size_t index, std::string value) {
@@ -911,6 +961,29 @@ inline bool RumbleEnabled(bool fallback = true) {
 inline bool SetRumbleEnabled(bool value) {
     Mutable().rumbleEnabled = value;
     return WriteSetting("controller", "rumble", value ? "true" : "false");
+}
+
+inline bool XboxOriginalLayout() {
+    const auto& layout = Get().controllerLayout;
+    return layout && *layout == "xbox_original";
+}
+
+inline bool SetXboxOriginalLayout(bool value) {
+    Mutable().controllerLayout = value ? "xbox_original" : "gamecube";
+    // An explicit F10 choice, including the already-selected preset, ends launcher auto-selection.
+    const bool wroteIntent = WriteSetting("launcher", "auto_controller_layout", "false");
+    return WriteSetting("controller", "layout", FormatString(*Mutable().controllerLayout)) && wroteIntent;
+}
+
+// 0 = Black (sneak, default right bumper), 1 = White (soap bubble, default left bumper).
+inline std::string XboxButton(size_t index) {
+    const auto& value = Get().xboxButtons[index & 1];
+    return value ? *value : (index == 0 ? "right_shoulder" : "left_shoulder");
+}
+
+inline bool SetXboxButton(size_t index, const std::string& value) {
+    Mutable().xboxButtons[index & 1] = value;
+    return WriteSetting("controller", (index & 1) == 0 ? "xbox_black" : "xbox_white", FormatString(value));
 }
 
 inline int32_t MuteHotkey(int32_t fallback) {
@@ -1002,6 +1075,72 @@ inline bool SetGpuCompat(int32_t value) {
 inline bool SetAspectMode(int32_t value) {
     Mutable().aspectMode = value;
     return WriteSetting("video", "aspect_mode", std::to_string(value));
+}
+
+// Motion blur strength in percent, 0 = off. The menus offer the levels below; any other value from 0 to 100 works too.
+inline int32_t MotionBlur(int32_t fallback = 0) {
+    return Get().motionBlur.value_or(fallback);
+}
+
+struct MotionBlurLevel {
+    const char* name;
+    int32_t percent;
+};
+inline constexpr MotionBlurLevel kMotionBlurLevels[] = {
+    {"Off", 0}, {"Extra low", 10}, {"Low", 20}, {"Medium", 30}, {"High", 40}, {"Extra high", 50},
+};
+
+// How many frames of motion a strength smears each pixel over (aurora_set_motion_blur): 100% = four, 25% = one.
+// Stylised above about 12%: a real camera's shutter (half a frame or less) is hard to see at 60 fps.
+inline float MotionBlurShutter(int32_t percent) {
+    return static_cast<float>(std::clamp(percent, 0, 100)) / 25.0f;
+}
+
+inline bool SetMotionBlur(int32_t value) {
+    Mutable().motionBlur = value;
+    return WriteSetting("video", "motion_blur", std::to_string(value));
+}
+
+// Ambient occlusion strength in percent, 0 = off (aurora_set_ambient_occlusion takes it as 0 to 1). The menus offer the
+// levels below; any other value from 0 to 100 works too.
+inline int32_t AmbientOcclusion(int32_t fallback = 0) {
+    return Get().ambientOcclusion.value_or(fallback);
+}
+
+inline constexpr MotionBlurLevel kAmbientOcclusionLevels[] = {
+    {"Off", 0}, {"Low", 35}, {"Medium", 65},
+};
+
+inline bool SetAmbientOcclusion(int32_t value) {
+    Mutable().ambientOcclusion = value;
+    return WriteSetting("video", "ambient_occlusion", std::to_string(value));
+}
+
+// Cartoon ink outlines: 0 off, 1 thin, 2 bold (aurora_set_ink_outlines).
+inline int32_t InkOutlines(int32_t fallback = 0) {
+    return Get().inkOutlines.value_or(fallback);
+}
+
+inline constexpr const char* kInkOutlineLevels[] = {"Off", "Thin", "Bold"};
+
+inline bool SetInkOutlines(int32_t value) {
+    Mutable().inkOutlines = value;
+    return WriteSetting("video", "ink_outlines", std::to_string(value));
+}
+
+// Bloom strength in percent, 0 = off (aurora_set_bloom takes it as 0 to 1). The menus offer the levels below; any other
+// value from 0 to 100 works too.
+inline int32_t Bloom(int32_t fallback = 0) {
+    return Get().bloom.value_or(fallback);
+}
+
+inline constexpr MotionBlurLevel kBloomLevels[] = {
+    {"Off", 0}, {"Low", 40}, {"Medium", 70}, {"High", 100},
+};
+
+inline bool SetBloom(int32_t value) {
+    Mutable().bloom = value;
+    return WriteSetting("video", "bloom", std::to_string(value));
 }
 
 inline bool SetForceAspect169(bool value) {
@@ -1126,9 +1265,16 @@ inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
     return ok;
 }
 
-// Target frame rate for frame interpolation, or 0 to disable it.
+// Target frame rate for frame interpolation, or 0 to disable it. Always 0 at 30 fps ([video] fps60 off), whatever the
+// file says: vi.cpp would report every frame as late there, so it would do nothing. The saved value isn't touched.
+inline uint32_t FrameInterpolationFpsIn(const RuntimeUserConfig& config, uint32_t fallback = 0) {
+    // Interpolation needs the game at 60 fps. Scooby-Doo! Unmasked always runs at 60 (no [video] fps60 option, unlike
+    // Night of 100 Frights at 30), so a missing fps60 counts as on.
+    return config.fps60.value_or(true) ? config.frameInterpolationFps.value_or(fallback) : 0;
+}
+
 inline uint32_t FrameInterpolationFps(uint32_t fallback = 0) {
-    return Get().frameInterpolationFps.value_or(fallback);
+    return FrameInterpolationFpsIn(Get(), fallback);
 }
 
 // Whether to skip draws whose graphics pipeline has not finished compiling yet.
@@ -1145,8 +1291,51 @@ inline uint32_t Msaa(uint32_t fallback = 1) {
     return Get().msaa.value_or(fallback);
 }
 
+// NO100F: end the boot logo movies and the intro movie after their first frame (launcher "Skip intro movies").
+inline bool Fps60(bool fallback = true) {  // Unmasked: always 60 fps (see FrameInterpolationFpsIn)
+    return Get().fps60.value_or(fallback);
+}
+
 inline bool SkipIntro(bool fallback = false) {
     return Get().skipIntro.value_or(fallback);
+}
+
+// NO100F: the date the hubs' holiday events see (launcher "Holidays"): "auto" = today, "off" = none, "confetti" = Jan 1
+// with confetti firework bursts, "MM-DD" = that day.
+inline std::string Holiday() {
+    return Get().holiday.value_or("auto");
+}
+
+// NO100F [game] dev_tools: the F8 dev menu and the DEV build mark. Read at startup: the dev menu reserves a page of
+// guest memory before boot only when it is on. NO100F_DEV_TOOLS=1 (or 0) overrides the file: the debug kit's scripts
+// (tools/debug) set it so their sessions have the dev menu without touching the player's settings.
+inline bool DevTools() {
+    if (const char* env = std::getenv("NO100F_DEV_TOOLS"); env != nullptr && *env != '\0') {
+        return *env != '0';
+    }
+    return Get().devTools.value_or(false);
+}
+
+// NO100F [game] record_audio: F3 videos (developer tools) include the game's own sound (default on). Read when a
+// recording starts; the dev menu's toggle writes it.
+inline bool RecordAudio() {
+    return Get().recordAudio.value_or(true);
+}
+
+inline bool SetRecordAudio(bool value) {
+    Mutable().recordAudio = value;
+    return WriteSetting("game", "record_audio", value ? "true" : "false");
+}
+
+// NO100F [game] capture_overlay: with the developer tools on, F2 screenshots and F3 videos show the F8/F10 menus and
+// notices too; off (default) = only the DEV stamp. The dev menu's toggle writes it.
+inline bool CaptureOverlay() {
+    return Get().captureOverlay.value_or(false);
+}
+
+inline bool SetCaptureOverlay(bool value) {
+    Mutable().captureOverlay = value;
+    return WriteSetting("game", "capture_overlay", value ? "true" : "false");
 }
 
 inline bool ShowFps(bool fallback = true) {
@@ -1157,14 +1346,29 @@ inline bool TextureReplacements(bool fallback = true) {
     return Get().textureReplacements.value_or(fallback);
 }
 
+// [video] cutout_mode: how cut-out draws (leaves, grass, webs) are drawn, as aurora_set_cutout_mode takes it:
+// "game" 0 = the game's own alpha test, "cut" 1 = alpha > 127 for HD replacements, "twopass" 2 = solid and faint parts
+// in two passes for HD replacements, "twopass_all" 3 = two passes for original textures too.
+inline int CutoutMode(int fallback = 3) {
+    return Get().cutoutMode.value_or(fallback);
+}
+
 // Dumping only produces the names a replacement would need, so main.cpp
 // gates it on TextureReplacements() as well.
 inline bool TextureDumps(bool fallback = false) {
     return Get().textureDumps.value_or(fallback);
 }
 
-inline uint32_t DisabledPostProcessingPaths(uint32_t fallback = 0) {
-    return Get().disabledPostProcessingPaths.value_or(fallback) & 0x10u;
+// [video] sharp_font: aurora redraws the game's font sheets at a high resolution as they load
+// (aurora-main/lib/gfx/sharp_font.cpp), ahead of the downloaded HD packs. Read once, at startup.
+inline bool SharpFont(bool fallback = true) {
+    return Get().sharpFont.value_or(fallback);
+}
+
+// [video] sharp_icons: aurora redraws the flat pause menu and map icons at a high resolution as they load
+// (aurora-main/lib/gfx/sharp_font.cpp), only where no replacement file exists. Read once, at startup.
+inline bool SharpIcons(bool fallback = true) {
+    return Get().sharpIcons.value_or(fallback);
 }
 
 inline std::string GraphicsApi(std::string fallback = "auto") {
@@ -1173,6 +1377,30 @@ inline std::string GraphicsApi(std::string fallback = "auto") {
 
 inline std::string DisplayMode(std::string fallback = "borderless") {
     return Get().displayMode.value_or(std::move(fallback));
+}
+
+// RecompLauncher (recomplauncher.com, recomplauncher.json at the zip's top) starts the game with RECOMPLAUNCHER=1, and
+// RECOMPLAUNCHER_MODE=bigpicture when Play was pressed in its full-screen controller view.
+inline bool StartedByRecompLauncher() {
+    const char* env = std::getenv("RECOMPLAUNCHER");
+    return env != nullptr && std::string_view(env) == "1";
+}
+
+inline bool RecompLauncherBigPicture() {
+    const char* env = std::getenv("RECOMPLAUNCHER_MODE");
+    return StartedByRecompLauncher() && env != nullptr && std::string_view(env) == "bigpicture";
+}
+
+// The display mode the game opens in: the saved one, except that a start from RecompLauncher's Big Picture mode (a
+// controller on the couch, maybe no mouse in reach) opens borderless full screen even when a window was saved. Only for
+// this run: nothing is written unless the player changes the mode.
+inline std::string StartDisplayMode() {
+    std::string mode = DisplayMode("borderless");
+    return mode == "windowed" && RecompLauncherBigPicture() ? std::string("borderless") : mode;
+}
+
+inline std::string FullscreenDisplay(std::string fallback = "auto") {
+    return Get().fullscreenDisplay.value_or(std::move(fallback));
 }
 
 inline bool NetworkEnabled(bool fallback = true) {
@@ -1189,7 +1417,7 @@ inline std::string DvdRoot(std::string fallback = "") {
 
 // The one resolver for configured paths. A relative value means the same thing
 // everywhere it can be configured: relative to the config file that named it,
-// never to the process working directory (docs/WHEELWIZARD_CONTRACT.md).
+// never to the process working directory.
 inline std::filesystem::path ResolveRelativeTo(const std::filesystem::path& base,
                                                const std::string& value) {
     std::filesystem::path path = PathFromUtf8(value);
@@ -1209,8 +1437,110 @@ inline std::filesystem::path ResolvedDvdRoot() {
     return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
 }
 
-// NSMBW: a game folder for this run only, not saved (a "game" folder beside the program, so each
-// install plays its own game while they all share Documents\MarioWiiSaveData).
+// The saves (MemoryCard, and NAND for Wii games): [paths] saves_dir when set (absolute, or relative to Config.toml's
+// folder; the launcher's Extras > Folders sets it), else Saved Games\FrightWorks when installed, else UserData\Saves.
+inline std::filesystem::path SavesDirectory() {
+    const std::string configured = Get().savesDir.value_or("");
+    if (!configured.empty()) {
+        return ResolveRelativeToConfig(configured);
+    }
+#ifdef _WIN32
+    if (!PortableRootDirectory()) {
+        if (const auto savedGames = KnownFolder(FOLDERID_SavedGames)) {
+            return *savedGames / kInstalledUserFolderName;
+        }
+    }
+#endif
+    return ApplicationDataDirectory() / "Saves";
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+// The XDG user folder (Pictures, Videos) of the person running the game: the line XDG_<NAME>_DIR="$HOME/..." in
+// $XDG_CONFIG_HOME/user-dirs.dirs (xdg-user-dirs), else $HOME/<fallback>; empty when there is no home folder either.
+// Environment.SpecialFolder.MyPictures / MyVideos in launcher/DataPaths.cs finds the same folders.
+inline std::filesystem::path XdgUserDirectory(const char* name, const char* fallback) {
+    const char* home = std::getenv("HOME");
+    const std::string key = std::string("XDG_") + name + "_DIR";
+    const auto expand = [&](std::string value) -> std::filesystem::path {
+        constexpr std::string_view kHome = "$HOME";
+        if (value.compare(0, kHome.size(), kHome) == 0) {
+            if (!home || !*home) {
+                return {};
+            }
+            value = std::string(home) + value.substr(kHome.size());
+        }
+        return std::filesystem::path(value).is_absolute() ? std::filesystem::path(value) : std::filesystem::path{};
+    };
+    std::filesystem::path config;
+    if (const char* xdgConfigHome = std::getenv("XDG_CONFIG_HOME"); xdgConfigHome && *xdgConfigHome) {
+        config = xdgConfigHome;
+    } else if (home && *home) {
+        config = std::filesystem::path(home) / ".config";
+    }
+    if (!config.empty()) {
+        std::ifstream in(config / "user-dirs.dirs");
+        const std::string prefix = key + "=\"";
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t start = line.find_first_not_of(" \t");
+            if (start == std::string::npos || line.compare(start, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            const size_t end = line.find('"', start + prefix.size());
+            if (end == std::string::npos) {
+                continue;
+            }
+            if (auto path = expand(line.substr(start + prefix.size(), end - start - prefix.size())); !path.empty()) {
+                return path;
+            }
+        }
+    }
+    return home && *home ? std::filesystem::path(home) / fallback : std::filesystem::path{};
+}
+#endif
+
+// F2 screenshots and F3 videos. Installed on Windows: Pictures\FrightWorks and Videos\FrightWorks. Without the portable
+// marker on Linux (the AppImage, whose own folder is read only): the same names under the XDG Pictures and Videos
+// folders (~/Pictures/FrightWorks when xdg-user-dirs isn't set up). Portable: Screenshots\ and Videos\ beside the
+// launcher (the folder above data\ in a release, the game's own folder in a source build).
+inline std::filesystem::path CaptureDirectory(bool videos) {
+#ifdef _WIN32
+    if (!PortableRootDirectory()) {
+        if (const auto folder = KnownFolder(videos ? FOLDERID_Videos : FOLDERID_Pictures)) {
+            return *folder / kInstalledUserFolderName;
+        }
+    }
+#elif !defined(__APPLE__) && !defined(__ANDROID__)
+    if (!PortableRootDirectory()) {
+        const auto folder = videos ? XdgUserDirectory("VIDEOS", "Videos") : XdgUserDirectory("PICTURES", "Pictures");
+        if (!folder.empty()) {
+            return folder / "FrightWorks";
+        }
+    }
+#endif
+    const auto executableDirectory = ExecutableDirectory();
+    std::filesystem::path root = executableDirectory ? *executableDirectory : std::filesystem::current_path();
+    if (root.filename() == "data") {
+        root = root.parent_path();
+    }
+    return root / (videos ? "Videos" : "Screenshots");
+}
+
+// CaptureDirectory as the game's notices name it, ending in a separator (Videos\, Pictures\FrightWorks\, ...; forward
+// slashes on Linux).
+inline std::string CaptureDirectoryLabel(bool videos) {
+    if (PortableRootDirectory()) {
+        return videos ? "Videos\\" : "Screenshots\\";
+    }
+#ifdef _WIN32
+    return videos ? "Videos\\FrightWorks\\" : "Pictures\\FrightWorks\\";
+#else
+    return videos ? "Videos/FrightWorks/" : "Pictures/FrightWorks/";
+#endif
+}
+
+// A game folder for this run only, not saved (a "game" folder beside the program, so each
+// install plays its own game with its own saves).
 inline void UseDvdRootForThisRun(const std::filesystem::path& path) {
     Mutable().dvdRoot = PathToUtf8(path);
 }
@@ -1222,16 +1552,18 @@ inline bool SetDvdRoot(const std::filesystem::path& path) {
     return WriteSetting("paths", "dvd_root", FormatString(value));
 }
 
-/// The canonical Retro Rewind installation the frontend owns, or "" when none is recorded.
-inline std::string RetroRewindRoot(std::string fallback = "") {
-    return Get().retroRewindRoot.value_or(std::move(fallback));
+/// The canonical mod installation the frontend owns, or "" when none is recorded.
+inline std::string ModInstallRoot(std::string fallback = "") {
+    return Get().modInstallRoot.value_or(std::move(fallback));
 }
 
 inline bool DiscordPresenceEnabled(bool fallback = true) {
     return Get().discordPresenceEnabled.value_or(fallback);
 }
 
-inline std::string DiscordClientId(std::string fallback = "1543984562369990706") {
+// No default application: FrightWorks has no Discord app of its own yet, so base-game presence only starts when
+// [discord] client_id is set (WiiCompiled's app ID was 1543984562369990706).
+inline std::string DiscordClientId(std::string fallback = "") {
     return Get().discordClientId.value_or(std::move(fallback));
 }
 
@@ -1267,6 +1599,18 @@ inline void LogLoadedConfig() {
             if (config.frameInterpolationFps) {
                 std::cout << " frame_interpolation_fps=" << *config.frameInterpolationFps;
             }
+            if (config.motionBlur) {
+                std::cout << " motion_blur=" << *config.motionBlur;
+            }
+            if (config.ambientOcclusion) {
+                std::cout << " ambient_occlusion=" << *config.ambientOcclusion;
+            }
+            if (config.inkOutlines) {
+                std::cout << " ink_outlines=" << *config.inkOutlines;
+            }
+            if (config.bloom) {
+                std::cout << " bloom=" << *config.bloom;
+            }
             if (config.skipUnreadyPipelines) {
                 std::cout << " skip_unready_pipelines=" << (*config.skipUnreadyPipelines ? "true" : "false");
             }
@@ -1281,6 +1625,12 @@ inline void LogLoadedConfig() {
             }
             if (config.textureDumps) {
                 std::cout << " texture_dumps=" << (*config.textureDumps ? "true" : "false");
+            }
+            if (config.sharpFont) {
+                std::cout << " sharp_font=" << (*config.sharpFont ? "true" : "false");
+            }
+            if (config.sharpIcons) {
+                std::cout << " sharp_icons=" << (*config.sharpIcons ? "true" : "false");
             }
             if (config.audioVolume) {
                 std::cout << " audio_volume=" << *config.audioVolume;
@@ -1297,8 +1647,8 @@ inline void LogLoadedConfig() {
             if (config.nandRoot) {
                 std::cout << " nand_root=" << *config.nandRoot;
             }
-            if (config.retroRewindRoot) {
-                std::cout << " retro_rewind_root=" << *config.retroRewindRoot;
+            if (config.modInstallRoot) {
+                std::cout << " retro_rewind_root=" << *config.modInstallRoot;
             }
         }
         std::cout << std::endl;

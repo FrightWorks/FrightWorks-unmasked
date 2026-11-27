@@ -13,7 +13,7 @@ bool Require(bool value, const char* message) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     {
         std::istringstream input("[video]\nmetalfx_spatial_upscaling = true\n");
         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "enabled.toml");
@@ -30,6 +30,174 @@ int main() {
         std::istringstream input("[video]\nmetalfx_spatial_upscaling = \"yes\"\n");
         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "invalid.toml");
         if (!Require(!config.metalFxSpatialUpscaling, "invalid MetalFX setting was accepted")) return 1;
+    }
+    {
+        std::istringstream input("[video]\nhdr = false\nhdr_paper_white_nits = 187.125\nhdr_peak_nits = 777.25\n");
+        const auto config = RuntimeConfigFile::ParseConfig(input, "saved-hdr.toml");
+        if (!Require(config.hdr == std::optional<bool>{false} && config.hdrPaperWhiteNits == 187.125f &&
+                     config.hdrPeakNits == 777.25f, "explicit off or precise HDR values were lost")) return 1;
+    }
+    {
+        std::istringstream input("[video]\nhdr = true\nhdr_paper_white_nits = 80\nhdr_peak_nits = 10000\n");
+        auto config = RuntimeConfigFile::ParseConfig(input, "launcher-hdr.toml");
+        if (!Require(RuntimeConfigFile::Hdr(config) && RuntimeConfigFile::HdrPaperWhiteNits(config) == 80.f &&
+                     RuntimeConfigFile::HdrPeakNits(config) == 10000.f, "launcher HDR endpoints differ from runtime")) return 1;
+        config.hdrPaperWhiteNits = 1000.f;
+        config.hdrPeakNits = 80.f;
+        if (!Require(RuntimeConfigFile::HdrPaperWhiteNits(config) == 1000.f && RuntimeConfigFile::HdrPeakNits(config) == 80.f,
+                     "opposite HDR endpoints differ from launcher")) return 1;
+    }
+    {
+        std::istringstream input("[video]\nhdr_peak_nits = 1234.5\n");
+        const auto config = RuntimeConfigFile::ParseConfig(input, "partial-hdr.toml");
+        if (!Require(!config.hdr && !config.hdrPaperWhiteNits && config.hdrPeakNits == 1234.5f,
+                     "absent HDR keys confused with explicit defaults")) return 1;
+    }
+    {
+        const RuntimeUserConfig empty;
+        if (!Require(!RuntimeConfigFile::Hdr(empty) && RuntimeConfigFile::HdrPaperWhiteNits(empty) == 200.f &&
+                     RuntimeConfigFile::HdrPeakNits(empty) == 1000.f, "safe HDR defaults changed")) return 1;
+        if (!Require(!RuntimeConfigFile::SetHdrPaperWhiteNits(79.f) && !RuntimeConfigFile::SetHdrPaperWhiteNits(1001.f) &&
+                     !RuntimeConfigFile::SetHdrPeakNits(79.f) && !RuntimeConfigFile::SetHdrPeakNits(10001.f) &&
+                     !RuntimeConfigFile::SetHdrPeakNits(std::numeric_limits<float>::quiet_NaN()),
+                     "invalid HDR values accepted")) return 1;
+    }
+    for (const char* holiday : {"auto", "off", "confetti", "01-01", "12-25"}) {
+        std::istringstream input(std::string("[game]\nholiday = \"") + holiday + "\"\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "holiday.toml");
+        if (!Require(config.holiday == std::optional<std::string>{holiday}, "valid holiday setting was not loaded")) return 1;
+    }
+    for (const char* holiday : {"Confetti", "confettis", "", "13-01", "01-32"}) {
+        std::istringstream input(std::string("[game]\nholiday = \"") + holiday + "\"\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "bad-holiday.toml");
+        if (!Require(!config.holiday, "invalid holiday setting was accepted")) return 1;
+    }
+    // Frame interpolation only runs at 60 fps: a config that asks for it at 30 fps gets it off, however it got there.
+    {
+        const struct {
+            const char* video;
+            uint32_t fps;
+        } cases[] = {
+            {"", 0},
+            // Unmasked always runs at 60 fps: no fps60 key counts as on (FrameInterpolationFpsIn).
+            {"frame_interpolation_fps = 120\n", 120},
+            {"fps60 = false\nframe_interpolation_fps = 120\n", 0},
+            {"fps60 = false\nframe_interpolation_fps = 180\n", 0},
+            {"fps60 = false\nframe_interpolation_fps = 240\n", 0},
+            {"fps60 = true\n", 0},
+            {"fps60 = true\nframe_interpolation_fps = 0\n", 0},
+            {"fps60 = true\nframe_interpolation_fps = 120\n", 120},
+            {"fps60 = true\nframe_interpolation_fps = 180\n", 180},
+            {"fps60 = true\nframe_interpolation_fps = 240\n", 180},
+            {"fps60 = true\nframe_interpolation_fps = 60\n", 0},
+        };
+        for (const auto& c : cases) {
+            std::istringstream input(std::string("[video]\n") + c.video);
+            const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "interpolation.toml");
+            if (RuntimeConfigFile::FrameInterpolationFpsIn(config) != c.fps) {
+                std::cerr << "wrong interpolation for: " << c.video << '\n';
+                return 1;
+            }
+        }
+    }
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+    {
+        // F2 / F3 folders without the portable marker (the AppImage): the XDG Pictures and Videos folders, else ~/Pictures and
+        // ~/Videos; a relative path in user-dirs.dirs is ignored.
+        namespace fs = std::filesystem;
+        const fs::path scratch = fs::temp_directory_path() / "frightworks-xdg-folders-test";
+        fs::remove_all(scratch);
+        fs::create_directories(scratch / "config");
+        setenv("HOME", (scratch / "home").c_str(), 1);
+        setenv("XDG_CONFIG_HOME", (scratch / "config").c_str(), 1);
+        if (!Require(RuntimeConfigFile::XdgUserDirectory("PICTURES", "Pictures") == scratch / "home" / "Pictures" &&
+                     RuntimeConfigFile::XdgUserDirectory("VIDEOS", "Videos") == scratch / "home" / "Videos",
+                     "no user-dirs.dirs: Pictures and Videos under home expected")) return 1;
+        const auto writeDirs = [&](const char* text) { std::ofstream(scratch / "config" / "user-dirs.dirs") << text; };
+        writeDirs("# comment\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\n  XDG_PICTURES_DIR=\"$HOME/Bilder\"\nXDG_VIDEOS_DIR=\"/data/Clips\"\n");
+        if (!Require(RuntimeConfigFile::XdgUserDirectory("PICTURES", "Pictures") == scratch / "home" / "Bilder" &&
+                     RuntimeConfigFile::XdgUserDirectory("VIDEOS", "Videos") == fs::path("/data/Clips"),
+                     "user-dirs.dirs folders not used")) return 1;
+        writeDirs("XDG_PICTURES_DIR=\"Bilder\"\nXDG_VIDEOS_DIR=\"$HOME/unterminated\n");
+        if (!Require(RuntimeConfigFile::XdgUserDirectory("PICTURES", "Pictures") == scratch / "home" / "Pictures" &&
+                     RuntimeConfigFile::XdgUserDirectory("VIDEOS", "Videos") == scratch / "home" / "Videos",
+                     "relative or broken user-dirs.dirs lines must fall back to home")) return 1;
+        fs::remove_all(scratch);
+    }
+#endif
+    {
+        // The F2 / F3 notices name the folder with the platform's own separator: backslashes on Windows, slashes elsewhere.
+        // Only checked where this test isn't run beside a portable marker (then it names the Screenshots and Videos folders).
+        if (!RuntimeConfigFile::PortableRootDirectory()) {
+#ifdef _WIN32
+            const bool labelsRight = RuntimeConfigFile::CaptureDirectoryLabel(false) == "Pictures\\FrightWorks\\" &&
+                                     RuntimeConfigFile::CaptureDirectoryLabel(true) == "Videos\\FrightWorks\\";
+#elif !defined(__APPLE__) && !defined(__ANDROID__)
+            const bool labelsRight = RuntimeConfigFile::CaptureDirectoryLabel(false) == "Pictures/FrightWorks/" &&
+                                     RuntimeConfigFile::CaptureDirectoryLabel(true) == "Videos/FrightWorks/";
+#else
+            const bool labelsRight = true;
+#endif
+            if (!Require(labelsRight, "capture folder labels are wrong for this platform")) return 1;
+        }
+    }
+    // Persistence is opt-in and must use a caller-owned portable copy of this CPU test.
+    if (argc == 2) {
+        const auto executable = RuntimeConfigFile::ExecutableDirectory();
+        const auto expected = std::filesystem::absolute(argv[1]).lexically_normal();
+        if (!Require(executable && std::filesystem::is_regular_file(*executable / "portable.txt") &&
+                     expected == (*executable / "UserData" / "Config.toml").lexically_normal(),
+                     "persistence checks require a portable marker and exact owned fixture path")) return 1;
+        if (!Require(RuntimeConfigFile::ResolveConfigPath() == expected, "portable config path mismatch")) return 1;
+        std::filesystem::create_directories(expected.parent_path());
+        // Each persistence block starts from the same fixture: the layout block ends with manual intent set
+        // (automatic matching off, layout "gamecube"), which the HDR block must not inherit.
+        const auto writeFixture = [&expected]() {
+            std::ofstream initial(expected, std::ios::trunc);
+            initial << "[launcher]\nauto_controller_layout = true\nauto_controller_layout_value = \"xbox_original\"\n"
+                       "[video]\nhdr = false\nhdr_paper_white_nits = 237.5\nhdr_peak_nits = 1234.5\n"
+                       "[controller]\nlayout = \"xbox_original\"\na = \"north@30,east\"\n"
+                       "xbox_black = \"left_paddle1\"\n[future]\nvalue = \"keep\"\n";
+            return static_cast<bool>(initial);
+        };
+        if (!Require(writeFixture(), "could not initialize fixture config")) return 1;
+        for (bool original : {true, false}) {
+            if (!Require(RuntimeConfigFile::WriteSetting("launcher", "auto_controller_layout", "true"),
+                         "could not reset automatic intent")) return 1;
+            if (!Require(RuntimeConfigFile::SetXboxOriginalLayout(original), "manual F10 preset write failed")) return 1;
+            const auto document = toml::parse(expected.string());
+            if (!Require(!toml::find<bool>(document, "launcher", "auto_controller_layout") &&
+                         toml::find<std::string>(document, "controller", "layout") ==
+                         (original ? "xbox_original" : "gamecube"),
+                         "same-value or changed manual preset did not stop automatic matching")) return 1;
+            if (!Require(toml::find<std::string>(document, "launcher", "auto_controller_layout_value") == "xbox_original" &&
+                         toml::find<std::string>(document, "controller", "a") == "north@30,east" &&
+                         toml::find<std::string>(document, "controller", "xbox_black") == "left_paddle1" &&
+                         toml::find<std::string>(document, "future", "value") == "keep" &&
+                         !toml::find<bool>(document, "video", "hdr") &&
+                         toml::find<double>(document, "video", "hdr_paper_white_nits") == 237.5 &&
+                         toml::find<double>(document, "video", "hdr_peak_nits") == 1234.5,
+                         "manual preset changed remembered intent, HDR, bindings or unrelated data")) return 1;
+        }
+        std::cout << "PASS same-value/changed F10 manual intent and cross-setting preservation\n";
+        if (!Require(writeFixture(), "could not reinitialize fixture config for HDR persistence")) return 1;
+        if (!Require(RuntimeConfigFile::SetHdrPaperWhiteNits(321.5f) && RuntimeConfigFile::SetHdrPeakNits(2000.f),
+                     "valid HDR fixture persistence failed")) return 1;
+        const auto document = toml::parse(expected.string());
+        if (!Require(!toml::find<bool>(document, "video", "hdr") &&
+                     toml::find<double>(document, "video", "hdr_paper_white_nits") == 321.5 &&
+                     toml::find<double>(document, "video", "hdr_peak_nits") == 2000.0 &&
+                     toml::find<bool>(document, "launcher", "auto_controller_layout") &&
+                     toml::find<std::string>(document, "launcher", "auto_controller_layout_value") == "xbox_original" &&
+                     toml::find<std::string>(document, "controller", "layout") == "xbox_original" &&
+                     toml::find<std::string>(document, "controller", "a") == "north@30,east" &&
+                     toml::find<std::string>(document, "controller", "xbox_black") == "left_paddle1" &&
+                     toml::find<std::string>(document, "future", "value") == "keep",
+                     "HDR persistence changed manual intent or unrelated settings")) return 1;
+        std::cout << "PASS HDR persistence and preservation of controller intent/custom bindings\n";
+    } else if (argc != 1) {
+        std::cerr << "usage: runtime_config_tests [absolute portable fixture Config.toml]\n";
+        return 1;
     }
     return 0;
 }

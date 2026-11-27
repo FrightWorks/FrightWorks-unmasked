@@ -1,11 +1,14 @@
 #pragma once
 
 #include "settings_overlay.h"
+#include "no100f_recorder.h"
 #include "runtime_config.h"
 #include "display_settings.h"
+#include "runtime_log.h"
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
+#include <aurora/window_owner.hpp>
 #include <dolphin/gx/GXAurora.h>
 
 #include <cstdlib>
@@ -17,15 +20,15 @@
 #endif
 
 extern "C" bool g_dynamicAspectRatioEnabled;
-void ConfigureMkwDynamicAspect(bool widescreen, bool forceAspect169, uint32_t surfaceWidth, uint32_t surfaceHeight);
-void SetMkwForceAspect169(bool enabled);
-bool MkwForceAspect169Requested();
-void UpdateMkwDynamicAspectSurface(uint32_t surfaceWidth, uint32_t surfaceHeight);
+void ConfigureRecompDynamicAspect(bool widescreen, bool forceAspect169, uint32_t surfaceWidth, uint32_t surfaceHeight);
+void SetRecompForceAspect169(bool enabled);
+bool RecompForceAspect169Requested();
+void UpdateRecompDynamicAspectSurface(uint32_t surfaceWidth, uint32_t surfaceHeight);
 // Arms the "keep EGG::Frustum's projection scale" flag on every screen that
 // renders to a fixed-size offscreen target. Cheap and idempotent; called from
 // the GX viewport path so it beats bakes that never cross a frame boundary.
-void AssertMkwOffscreenScreenBypass();
-inline std::atomic_bool g_mkwDynamicAspectSurfacePending{false};
+void AssertRecompOffscreenScreenBypass();
+inline std::atomic_bool g_recompDynamicAspectSurfacePending{false};
 
 namespace WindowPlacementPersistence {
 inline bool sizeDirty = false;
@@ -55,14 +58,15 @@ inline void Flush(bool force = false) {
 }
 } // namespace WindowPlacementPersistence
 
-// The close event can be consumed while execution is inside a guest fiber
-// (for example, OSSleepThread).  Running normal C++/CRT shutdown from that
-// fiber re-enters runtime teardown and can fault while the fiber machinery is
-// still active.  A window close is an intentional successful exit, so end the
-// process directly and do not run the crash/atexit paths.
-[[noreturn]] inline void ExitForAuroraWindowClose() noexcept {
+// The owner path transfers close requests from guest fibers to the scheduler before
+// teardown. Platforms without an owner keep their direct successful-exit path.
+[[noreturn]] inline void ExitForAuroraWindowClose() {
+    if (aurora::window_owner::enabled())
+        throw aurora::window_owner::CloseRequested();
+    no100f_recorder::FinishForExit();  // a running F3 video: finish the file first
     settings_overlay::ReleaseControllers();
     WindowPlacementPersistence::Flush(true);
+    EndProcessTranscriptForExit("quit (window closed)");
 #if defined(_WIN32)
     ::ExitProcess(0);
 #else
@@ -70,8 +74,14 @@ inline void Flush(bool force = false) {
 #endif
 }
 
+// The game is stopped on purpose: the window is hidden or minimized, or out of focus with pause-on-focus-lost. The
+// hang watchdog (vi.cpp) doesn't count that time.
+inline std::atomic_bool g_auroraWindowPaused{false};
+
 // Update cached Aurora window/framebuffer dimensions based on pending events.
 inline void ProcessAuroraEvents(const AuroraEvent* events) {
+    if (aurora::window_owner::enabled()) aurora::window_owner::check();
+    if (aurora::window_owner::consume_close_request()) ExitForAuroraWindowClose();
     if (!events) {
         return;
     }
@@ -100,6 +110,10 @@ inline void ProcessAuroraEvents(const AuroraEvent* events) {
         case AURORA_DISPLAY_SCALE_CHANGED:
             surfaceChanged = true;
             break;
+        case AURORA_PAUSED:
+        case AURORA_UNPAUSED:
+            g_auroraWindowPaused.store(event->type == AURORA_PAUSED, std::memory_order_relaxed);
+            break;
         case AURORA_EXIT:
             ExitForAuroraWindowClose();
         default:
@@ -115,18 +129,18 @@ inline void ProcessAuroraEvents(const AuroraEvent* events) {
         // frame worker is intentionally waiting for begin permission. Joining
         // it here creates a circular wait. Record the newest native size and
         // apply it immediately after the next frame has been prepared.
-        g_mkwDynamicAspectSurfacePending.store(true, std::memory_order_release);
+        g_recompDynamicAspectSurfacePending.store(true, std::memory_order_release);
     }
     settings_overlay::HandleEvents(events);
 }
 
-inline void ApplyPendingMkwDynamicAspectSurface() {
+inline void ApplyPendingRecompDynamicAspectSurface() {
     // The OS can adjust a window without a resize event reaching the queue
     // (observed with hidden windows clamped to the work area), so re-read the
     // surface at every frame boundary instead of only on queued events.
-    // NSMBW: DisplaySettings owns the aspect (the viewport policy and the game's
+    // DisplaySettings owns the aspect (the viewport policy and the game's
     // widened canvas for Fill); it is idempotent and cheap for a stable size.
-    (void)g_mkwDynamicAspectSurfacePending.exchange(false, std::memory_order_acq_rel);
+    (void)g_recompDynamicAspectSurfacePending.exchange(false, std::memory_order_acq_rel);
     uint32_t surfaceWidth = 0;
     uint32_t surfaceHeight = 0;
     AuroraGetSurfaceSize(&surfaceWidth, &surfaceHeight);
@@ -137,7 +151,7 @@ inline bool BeginAuroraFrame() {
     if (!aurora_begin_frame()) {
         return false;
     }
-    ApplyPendingMkwDynamicAspectSurface();
+    ApplyPendingRecompDynamicAspectSurface();
     return true;
 }
 

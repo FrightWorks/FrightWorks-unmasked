@@ -980,7 +980,7 @@ extern "C" void DVDInit_8015EA1C()
     ScanDirectory(rootPath / "sys", "/sys/");
 
     const auto& overlays = RuntimeRiivolution::Overlays();
-    if (overlays.empty() && RuntimeProduct::IsRetroRewind()) {
+    if (overlays.empty() && RuntimeProduct::IsModProduct()) {
         RT_LOG(RT_TAG_DVD) << "WARNING: no Retro Rewind overlay root was found. "
                      "File replacements (menu archives, karts, drivers, courses) will not apply "
                      "and the game will look and play like the unmodded disc. Set "

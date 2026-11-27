@@ -13,7 +13,7 @@ extern "C" void func_8004A2E0(CpuContext*);
 extern "C" void func_8007BC54(CpuContext*);
 extern "C" void func_800F1658(CpuContext*);
 
-static void ScoobyCull_IsSphereInFrustrum_Original(CpuContext* MKW_RESTRICT ctx)
+static void ScoobyCull_IsSphereInFrustrum_Original(CpuContext* RECOMP_RESTRICT ctx)
 {
     uint32_t cr0_0 = 0;
     uint32_t r1_psq_tmp_0 = 0;

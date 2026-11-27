@@ -11,7 +11,7 @@
 
 extern "C" void func_8004A788(CpuContext*);
 
-static void ScoobyPvs_FindCameraRegion_Original(CpuContext* MKW_RESTRICT ctx)
+static void ScoobyPvs_FindCameraRegion_Original(CpuContext* RECOMP_RESTRICT ctx)
 {
     uint32_t cr0_0 = 0;
     uint32_t r0_rot_0 = 0;

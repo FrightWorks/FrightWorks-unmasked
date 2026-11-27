@@ -1288,7 +1288,7 @@ static bool ApplyAuroraIndexedXFArraysForDisplayList(const std::array<uint32_t, 
 
 } // namespace
 
-extern "C" unsigned g_spmAudit[8];  // aurora command_processor (SPM diagnostics)
+extern "C" unsigned g_gxAudit[8];  // aurora command_processor (SPM diagnostics)
 extern "C" int g_spmSweepDump;
 extern "C" void GxNotifyDisplayListMemoryWrite(uint32_t addr, uint32_t size) {
     GxGuestWrite::NotifyWrite(addr, size);
@@ -1347,7 +1347,7 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                           char b[160]; std::snprintf(b, sizeof b, " r%d %s f0 %08X f4 %08X bm %u col %08X", r, nm.c_str(), Memory::Read32(o), Memory::Read32(o + 4), Memory::Read8(o + 8), Memory::Read32(o + 0x10));
                           obj = b; break;
                       }
-                      RT_LOGF(RT_TAG_GX, "[spmcall] draw %u id %u addr %08X%s\n", g_spmAudit[0], (uint32_t(list[8]) << 24) | (uint32_t(list[9]) << 16) | (uint32_t(list[10]) << 8) | list[11], listAddr, obj.c_str());
+                      RT_LOGF(RT_TAG_GX, "[spmcall] draw %u id %u addr %08X%s\n", g_gxAudit[0], (uint32_t(list[8]) << 24) | (uint32_t(list[9]) << 16) | (uint32_t(list[10]) << 8) | list[11], listAddr, obj.c_str());
                   } }
                 g_boundTexMaps.fill(BoundTexInfo{});
                 EnsureAuroraFrameActive();
