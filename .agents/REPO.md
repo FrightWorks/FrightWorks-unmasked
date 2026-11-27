@@ -1,7 +1,7 @@
 # FrightWorks: UnMasked: shared notes for agents
 
 Rules and facts every agent working on this repo needs, whichever tool it runs in.
-This file is shared with everyone who can read the repo.
+This file is public.
 People and agents also keep their own git-ignored `AGENTS.md` at the repo root for anything specific to their machine (see "Your local AGENTS.md").
 The rules follow the sister project, FrightWorks-no100f (its `.agents/REPO.md`), adapted to what is true here.
 
@@ -16,7 +16,7 @@ The rules follow the sister project, FrightWorks-no100f (its `.agents/REPO.md`),
 - **Rules and lasting facts only.**
   Who is working on what belongs in GitHub issues and PRs.
   Case histories belong in skills.
-- **Write it as if it were public, and remember that agents act on it.**
+- **It's public, and agents act on it.**
   No personal paths, machine details, credentials, logs or game data.
   Review edits to `.agents/` as carefully as code.
 - **One sentence per line.**
@@ -66,7 +66,8 @@ Renaming them is its own PR: the exe names are wired through the scripts, the la
 - Everything reaches `main` through a PR, small docs changes too.
   Never push to `main`.
   Never force-push.
-  GitHub can't enforce this here (rulesets need a public repo or a paid plan), so it holds by agreement: the same rule as no100f, where rulesets do enforce it.
+  Rulesets enforce this with no bypass, even for admins: `main` takes changes only through a PR and can't be deleted or force-pushed.
+  GitHub deletes a PR's branch when it merges.
 - After a rebase or any history rewrite, check that the branch's diff against `origin/main` contains only your own changes.
   Resetting onto a `main` that moved, while your files still match the old one, silently undoes the new commits.
 - Fix-only PRs branch off `main` with minimal diffs and no heuristics that hide symptoms.
