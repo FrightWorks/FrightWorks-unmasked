@@ -31,5 +31,9 @@ __pycache__/
 *.pyc
 wiicompiled/buildtools/artifacts/
 
-# notes for development sessions, not part of the project
+# a person's own notes for development sessions, not part of the project (the shared ones are .agents/REPO.md)
 AGENTS.md
+/CLAUDE.md
+
+# Claude Code's local folder, never tracked: tools/setup-agents.py links .claude/skills to the tracked .agents/skills
+/.claude/

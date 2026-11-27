@@ -81,8 +81,8 @@ powershell -ExecutionPolicy Bypass -File tools\package-scooby.ps1 -Zip
 
 `build-scooby.ps1` translates the game (about 28,000 functions) and compiles it; the first build takes a while.
 The game lands in `Play\`, and `package-scooby.ps1` assembles `dist\ScoobyDooReMasked\` (and `-Zip` the release
-zip). Build logs are in `build-logs\`. `AGENTS.md` has the technical notes: how the logic modules, the display
-copy, the GameCube DVD/card/audio paths and the renderer fixes work.
+zip). Build logs are in `build-logs\`. [`.agents/REPO.md`](.agents/REPO.md) has the rules for contributors and
+the technical notes: how the logic modules, the GameCube DVD, card and audio paths, and packaging work.
 
 ### Layout
 
